@@ -1,3 +1,13 @@
+"""Per-session file-based state persistence.
+
+Claude Code hooks are ephemeral processes — state must be persisted to files.
+Each session gets its own JSON file at ``$CLAUDE_PLUGIN_DATA/state/{session_id}.json``.
+Concurrent sessions (different projects, terminals) never interfere.
+
+Uses ``fcntl.flock`` for cross-process locking and ``threading.Lock`` for
+same-process thread safety during atomic state mutations.
+"""
+
 import fcntl
 import json
 import os

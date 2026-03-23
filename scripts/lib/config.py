@@ -1,3 +1,15 @@
+"""Layered config loading for the HindClaw Claude Code plugin.
+
+Merges four configuration layers (highest priority wins):
+  1. Environment variables (HINDCLAW_API_URL, HINDCLAW_USER_ID, HINDCLAW_JWT_SECRET)
+  2. Project config (``.claude/hindclaw.json`` in project root)
+  3. User config (``~/.claude/hindclaw.json``)
+  4. Plugin defaults (``settings.json`` in ``$CLAUDE_PLUGIN_ROOT``)
+
+After merging, auto-resolves userId (git email fallback), agentName
+(git remote / folder basename), and bankId (``{prefix}::{agent}``).
+"""
+
 import json
 import os
 import subprocess
