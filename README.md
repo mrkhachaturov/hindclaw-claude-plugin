@@ -1,4 +1,4 @@
-# claude-hindclaw-plugin
+# hindclaw-claude-plugin
 
 Claude Code hooks plugin for [Hindsight](https://hindsight.vectorize.io) memory with JWT auth via [HindClaw](https://hindclaw.pro) server extensions.
 
@@ -21,7 +21,7 @@ Adds long-term memory to Claude Code sessions. The plugin signs JWTs per-request
 ```bash
 # Install via Claude Code plugin marketplace
 claude plugin marketplace add mrkhachaturov/ccode-personal-plugins
-claude plugin install claude-hindclaw-plugin
+claude plugin install hindclaw-claude-plugin
 ```
 
 ## Configuration
