@@ -3,20 +3,21 @@
 Flow:
   1. Read hook input JSON from stdin (session_id, cwd, prompt/user_prompt,
      optionally transcript_path).
-  2. Load config, check guards: autoRecall, healthy, bank not denied.
+  2. Load config, check guards: autoRecall, healthy, bankId, credentials.
   3. Extract prompt text (accepts both "prompt" and "user_prompt" keys).
   4. If prompt is empty or < 5 chars, exit silently.
   5. If recallContextTurns > 1 and transcript_path exists, read recent
      messages from the JSONL transcript and compose a multi-turn query.
   6. Truncate query to recallMaxQueryChars + apply a final defensive cap.
   7. Call client.recall(bank_id, query, ...).
-  8. On 403 → add bank to denied_banks, exit silently.
-     On 401 → mark session unhealthy, exit silently.
-     On other error → log to stderr, exit silently.
-  9. Apply recallTopK limit if set.
- 10. Format memories via content.format_memories().
- 11. If no results → exit silently (empty stdout, not empty JSON).
- 12. Wrap in <hindsight_memories> tags and write the UserPromptSubmit output
+  8. On 401/403 → systemMessage + additionalContext, mark_unhealthy,
+     set error_notified flag.
+     On 5xx/timeout → log to stderr, exit silently (retry next prompt).
+  9. Check for server-side warnings and surface once via systemMessage.
+ 10. Apply recallTopK limit if set.
+ 11. Format memories via content.format_memories().
+ 12. If no results → exit silently (empty stdout, not empty JSON).
+ 13. Wrap in <hindsight_memories> tags and write the UserPromptSubmit output
      JSON to stdout.
 """
 
@@ -31,7 +32,6 @@ _project_root = os.path.dirname(_scripts_dir)
 sys.path.insert(0, _scripts_dir)
 sys.path.insert(0, _project_root)
 
-from lib.auth import build_claims  # noqa: E402
 from lib.client import HindclawClient, HindclawHttpError  # noqa: E402
 from lib.config import debug_log, load_config  # noqa: E402
 from lib.content import (  # noqa: E402
@@ -41,27 +41,11 @@ from lib.content import (  # noqa: E402
     truncate_recall_query,
 )
 from lib.state import (  # noqa: E402
-    add_denied_bank,
-    is_bank_denied,
     is_healthy,
+    mark_unhealthy,
     read_session_state,
-    write_session_state,
+    set_flag,
 )
-
-
-def make_claims_builder(config: dict, hook_input: dict):
-    """Return a closure that builds JWT claims for this session.
-
-    Args:
-        config: Merged plugin config with userId, agentName, clientId.
-        hook_input: Claude Code hook input with session_id.
-
-    Returns:
-        Callable that returns a fresh claims dict each time it is called.
-    """
-    def claims_builder() -> dict:
-        return build_claims(config, hook_input)
-    return claims_builder
 
 
 def read_transcript_messages(transcript_path: str) -> list:
@@ -146,16 +130,11 @@ def main() -> None:
         debug_log(config, "recall: no bankId resolved, skipping")
         return
 
-    # Guard 4: bank denied this session
-    if is_bank_denied(session_id, bank_id):
-        debug_log(config, "recall: bank denied, skipping", bank_id)
-        return
-
-    # Guard 5: need API URL + JWT secret
+    # Guard 4: need API URL + API key
     api_url = config.get("hindsightApiUrl", "")
-    jwt_secret = config.get("jwtSecret", "")
-    if not api_url or not jwt_secret:
-        debug_log(config, "recall: missing hindsightApiUrl or jwtSecret, skipping")
+    api_key = config.get("apiKey", "")
+    if not api_url or not api_key:
+        debug_log(config, "recall: missing hindsightApiUrl or apiKey, skipping")
         return
 
     # Extract prompt text
@@ -169,7 +148,6 @@ def main() -> None:
     # Compose multi-turn query if configured
     recall_context_turns = int(config.get("recallContextTurns", 1))
     recall_max_query_chars = int(config.get("recallMaxQueryChars", 800))
-    recall_roles = config.get("recallRoles", ["user", "assistant"])
 
     messages = []
     if recall_context_turns > 1:
@@ -180,7 +158,7 @@ def main() -> None:
         else:
             debug_log(config, "recall: transcript_path not available for multi-turn context")
 
-    query = compose_recall_query(prompt, messages, recall_context_turns, recall_roles)
+    query = compose_recall_query(prompt, messages, recall_context_turns)
     query = truncate_recall_query(query, prompt, recall_max_query_chars)
 
     # Final defensive cap (matches upstream pattern)
@@ -190,15 +168,10 @@ def main() -> None:
     debug_log(config, f"recall: query length={len(query)}, bank={bank_id}")
 
     # Build client and call recall
-    client = HindclawClient(
-        api_url=api_url,
-        jwt_secret=jwt_secret,
-        claims_builder=make_claims_builder(config, hook_input),
-    )
+    client = HindclawClient(api_url=api_url, api_key=api_key)
 
     recall_budget = config.get("recallBudget", "mid")
     recall_max_tokens = int(config.get("recallMaxTokens", 1024))
-    recall_types = config.get("recallTypes", ["world", "experience"])
 
     try:
         response = client.recall(
@@ -206,29 +179,25 @@ def main() -> None:
             query,
             budget=recall_budget,
             max_tokens=recall_max_tokens,
-            types=recall_types,
         )
     except HindclawHttpError as exc:
-        if exc.status_code == 403:
-            print(
-                f"[HindClaw] recall: bank {bank_id!r} denied (403), skipping",
-                file=sys.stderr,
-            )
-            add_denied_bank(session_id, bank_id)
-            return
-        if exc.status_code == 401:
-            print(
-                "[HindClaw] recall: authentication failed (401), marking unhealthy",
-                file=sys.stderr,
-            )
+        if exc.status_code in (401, 403):
             state = read_session_state(session_id)
-            state["healthy"] = False
-            write_session_state(session_id, state)
+            if not state.get("error_notified"):
+                error_msg = f"HindClaw: memory access denied ({exc.status_code}). Check your API key and bank permissions."
+                output = {
+                    "systemMessage": error_msg,
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": f"<hindsight_error>{error_msg}</hindsight_error>",
+                    },
+                }
+                json.dump(output, sys.stdout)
+                set_flag(session_id, "error_notified", True)
+            mark_unhealthy(session_id)
             return
-        print(
-            f"[HindClaw] recall: HTTP error {exc.status_code}: {exc.body}",
-            file=sys.stderr,
-        )
+        # 5xx or other — log and retry next prompt
+        print(f"[HindClaw] recall: HTTP error {exc.status_code}: {exc.body}", file=sys.stderr)
         return
     except Exception as exc:
         print(f"[HindClaw] recall: unexpected error: {exc}", file=sys.stderr)
@@ -238,6 +207,15 @@ def main() -> None:
     if not results:
         debug_log(config, "recall: no results returned")
         return
+
+    # Check for server-side cap warnings
+    system_message = None
+    warnings = response.get("warnings")
+    if warnings:
+        state = read_session_state(session_id)
+        if not state.get("config_warned"):
+            system_message = f"HindClaw: {'; '.join(warnings)}. Update your config to avoid this warning."
+            set_flag(session_id, "config_warned", True)
 
     # Apply recallTopK limit
     recall_top_k = config.get("recallTopK")
@@ -257,10 +235,9 @@ def main() -> None:
         debug_log(config, "recall: format_memories returned empty string")
         return
 
-    preamble = config.get(
-        "recallPromptPreamble",
+    preamble = (
         "Relevant memories from past conversations (prioritize recent when conflicting). "
-        "Only use memories that are directly useful to continue this conversation; ignore the rest:",
+        "Only use memories that are directly useful to continue this conversation; ignore the rest:"
     )
     current_time = format_current_time()
     context_message = (
@@ -277,9 +254,11 @@ def main() -> None:
             "additionalContext": context_message,
         }
     }
+    if system_message:
+        output["systemMessage"] = system_message
 
     debug_log(config, f"recall: injecting {len(results)} memories from bank {bank_id!r}")
-    print(json.dumps(output))
+    json.dump(output, sys.stdout)
 
 
 if __name__ == "__main__":
