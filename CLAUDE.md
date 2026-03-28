@@ -21,6 +21,8 @@ CLAUDE.md
 
 ## Commands
 
+Test: `/usr/bin/python3.12 -m pytest tests/ -v`
+
 Use the repository's own documented test and release workflow. Prefer updating this repo directly
 like a normal standalone package repository.
 
