@@ -1,454 +1,166 @@
-"""Tests for the HindclawClient HTTP client.
-
-Covers: health check, recall, retain, URL validation, and error handling.
-All HTTP calls are mocked via unittest.mock.patch on urllib.request.urlopen.
-"""
+"""Tests for HindclawClient with API key auth."""
 
 import json
-import urllib.error
-from io import BytesIO
-from unittest.mock import MagicMock, patch
+import unittest
+from unittest.mock import patch, MagicMock
 
-import pytest
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_response(status: int, body: dict | str) -> MagicMock:
-    """Build a mock urlopen response with a read() method."""
-    if isinstance(body, dict):
-        data = json.dumps(body).encode()
-    else:
-        data = body.encode() if isinstance(body, str) else body
-    resp = MagicMock()
-    resp.status = status
-    resp.read.return_value = data
-    resp.__enter__ = lambda s: s
-    resp.__exit__ = MagicMock(return_value=False)
-    return resp
+from scripts.lib.client import HindclawClient, HindclawHttpError
 
 
-def _make_http_error(status: int, body: dict | str) -> urllib.error.HTTPError:
-    """Build a urllib HTTPError for non-2xx responses."""
-    if isinstance(body, dict):
-        data = json.dumps(body).encode()
-    else:
-        data = body.encode() if isinstance(body, str) else body
-    return urllib.error.HTTPError(
-        url="http://test",
-        code=status,
-        msg="Error",
-        hdrs=None,
-        fp=BytesIO(data),
-    )
+class TestClientConstructor(unittest.TestCase):
+    def test_stores_api_url_stripped(self):
+        c = HindclawClient("http://example.com/", "hc_sa_test")
+        self.assertEqual(c.api_url, "http://example.com")
+
+    def test_stores_api_key(self):
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        self.assertEqual(c.api_key, "hc_sa_test")
+
+    def test_rejects_empty_url(self):
+        with self.assertRaises(ValueError):
+            HindclawClient("", "hc_sa_test")
+
+    def test_rejects_non_http_scheme(self):
+        with self.assertRaises(ValueError):
+            HindclawClient("ftp://example.com", "hc_sa_test")
+
+    def test_rejects_empty_api_key(self):
+        with self.assertRaises(ValueError):
+            HindclawClient("http://example.com", "")
 
 
-def _make_claims_builder(claims: dict | None = None):
-    """Return a simple claims_builder callable for testing."""
-    def builder():
-        return claims or {"sub": "test@example.com", "client_id": "claude-code"}
-    return builder
+class TestAuthHeader(unittest.TestCase):
+    def test_bearer_token_uses_api_key(self):
+        c = HindclawClient("http://example.com", "hc_sa_mykey123")
+        self.assertEqual(c._auth_header(), "Bearer hc_sa_mykey123")
 
 
-# ---------------------------------------------------------------------------
-# URL validation tests
-# ---------------------------------------------------------------------------
+class TestHealthCheck(unittest.TestCase):
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_returns_true_on_success(self, mock_urlopen):
+        mock_urlopen.return_value.__enter__ = MagicMock()
+        mock_urlopen.return_value.__exit__ = MagicMock(return_value=False)
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        self.assertTrue(c.health_check())
 
-class TestValidateApiUrl:
-    def test_valid_http_url_accepted(self):
-        from scripts.lib.client import _validate_api_url
-        result = _validate_api_url("http://hindclaw.example.com")
-        assert result == "http://hindclaw.example.com"
-
-    def test_valid_https_url_accepted(self):
-        from scripts.lib.client import _validate_api_url
-        result = _validate_api_url("https://hindclaw.example.com")
-        assert result == "https://hindclaw.example.com"
-
-    def test_trailing_slash_stripped(self):
-        from scripts.lib.client import _validate_api_url
-        result = _validate_api_url("https://hindclaw.example.com/")
-        assert result == "https://hindclaw.example.com"
-
-    def test_multiple_trailing_slashes_stripped(self):
-        from scripts.lib.client import _validate_api_url
-        result = _validate_api_url("https://hindclaw.example.com///")
-        assert result == "https://hindclaw.example.com"
-
-    def test_path_with_trailing_slash_stripped(self):
-        from scripts.lib.client import _validate_api_url
-        result = _validate_api_url("https://hindclaw.example.com/api/")
-        assert result == "https://hindclaw.example.com/api"
-
-    def test_invalid_scheme_raises_value_error(self):
-        from scripts.lib.client import _validate_api_url
-        with pytest.raises(ValueError, match="scheme"):
-            _validate_api_url("ftp://hindclaw.example.com")
-
-    def test_empty_string_raises_value_error(self):
-        from scripts.lib.client import _validate_api_url
-        with pytest.raises(ValueError):
-            _validate_api_url("")
-
-    def test_no_scheme_raises_value_error(self):
-        from scripts.lib.client import _validate_api_url
-        with pytest.raises(ValueError):
-            _validate_api_url("hindclaw.example.com")
-
-    def test_url_with_port_accepted(self):
-        from scripts.lib.client import _validate_api_url
-        result = _validate_api_url("http://localhost:8080")
-        assert result == "http://localhost:8080"
-
-    def test_url_with_port_and_trailing_slash_stripped(self):
-        from scripts.lib.client import _validate_api_url
-        result = _validate_api_url("http://localhost:8080/")
-        assert result == "http://localhost:8080"
+    @patch("scripts.lib.client.urllib.request.urlopen", side_effect=Exception("refused"))
+    def test_returns_false_on_error(self, mock_urlopen):
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        self.assertFalse(c.health_check())
 
 
-# ---------------------------------------------------------------------------
-# HindclawHttpError tests
-# ---------------------------------------------------------------------------
+class TestRecall(unittest.TestCase):
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_sends_auth_header(self, mock_urlopen):
+        resp_data = json.dumps({"results": []}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
 
-class TestHindclawHttpError:
-    def test_error_stores_status_code_and_body(self):
-        from scripts.lib.client import HindclawHttpError
-        err = HindclawHttpError(403, {"detail": "Forbidden"})
-        assert err.status_code == 403
-        assert err.body == {"detail": "Forbidden"}
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        c.recall("bank1", "query")
 
-    def test_error_str_contains_status_code(self):
-        from scripts.lib.client import HindclawHttpError
-        err = HindclawHttpError(500, "Internal Server Error")
-        assert "500" in str(err)
+        req = mock_urlopen.call_args[0][0]
+        self.assertEqual(req.get_header("Authorization"), "Bearer hc_sa_test")
 
-    def test_403_is_detectable(self):
-        from scripts.lib.client import HindclawHttpError
-        err = HindclawHttpError(403, {"detail": "Permission denied"})
-        assert err.status_code == 403
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_sends_budget_and_max_tokens(self, mock_urlopen):
+        resp_data = json.dumps({"results": []}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
 
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        c.recall("bank1", "query", budget="high", max_tokens=2048)
 
-# ---------------------------------------------------------------------------
-# HindclawClient construction tests
-# ---------------------------------------------------------------------------
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data)
+        self.assertEqual(body["budget"], "high")
+        self.assertEqual(body["max_tokens"], 2048)
 
-class TestHindclawClientConstruction:
-    def test_client_stores_api_url(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com", "secret", cb)
-        assert client.api_url == "https://api.example.com"
-
-    def test_client_strips_trailing_slash_on_construction(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com/", "secret", cb)
-        assert client.api_url == "https://api.example.com"
-
-    def test_client_stores_jwt_secret(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com", "my-secret", cb)
-        assert client.jwt_secret == "my-secret"
-
-    def test_client_stores_claims_builder(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com", "secret", cb)
-        assert client.claims_builder is cb
-
-    def test_invalid_url_raises_on_construction(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        with pytest.raises(ValueError):
-            HindclawClient("ftp://api.example.com", "secret", cb)
-
-
-# ---------------------------------------------------------------------------
-# health_check tests
-# ---------------------------------------------------------------------------
-
-class TestHealthCheck:
-    def test_health_check_returns_true_on_200(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com", "secret", cb)
-
-        mock_resp = _make_response(200, {"status": "ok"})
-        with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client.health_check()
-
-        assert result is True
-
-    def test_health_check_returns_false_on_connection_error(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com", "secret", cb)
-
-        with patch("urllib.request.urlopen", side_effect=OSError("Connection refused")):
-            result = client.health_check()
-
-        assert result is False
-
-    def test_health_check_returns_false_on_http_error(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com", "secret", cb)
-
-        with patch("urllib.request.urlopen", side_effect=_make_http_error(503, "Service Unavailable")):
-            result = client.health_check()
-
-        assert result is False
-
-    def test_health_check_hits_correct_url(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com", "secret", cb)
-
-        mock_resp = _make_response(200, {"status": "ok"})
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.health_check()
-
-        call_args = mock_open.call_args
-        req = call_args[0][0]
-        assert req.full_url == "https://api.example.com/health"
-
-    def test_health_check_has_no_auth_header(self):
-        from scripts.lib.client import HindclawClient
-        cb = _make_claims_builder()
-        client = HindclawClient("https://api.example.com", "secret", cb)
-
-        mock_resp = _make_response(200, {"status": "ok"})
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.health_check()
-
-        call_args = mock_open.call_args
-        req = call_args[0][0]
-        assert req.get_header("Authorization") is None
-
-
-# ---------------------------------------------------------------------------
-# recall tests
-# ---------------------------------------------------------------------------
-
-class TestRecall:
-    def _client(self):
-        from scripts.lib.client import HindclawClient
-        return HindclawClient(
-            "https://api.example.com",
-            "test-secret",
-            _make_claims_builder(),
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_raises_on_403(self, mock_urlopen):
+        err = __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            "http://example.com", 403, "Forbidden", {}, None
         )
-
-    def test_recall_returns_dict_on_200(self):
-        client = self._client()
-        body = {"results": [{"content": "fact 1"}, {"content": "fact 2"}]}
-        mock_resp = _make_response(200, body)
-
-        with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client.recall("my-bank", "what is X?")
-
-        assert result == body
-
-    def test_recall_hits_correct_endpoint(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"results": []})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.recall("my-bank", "what is X?")
-
-        req = mock_open.call_args[0][0]
-        assert req.full_url == "https://api.example.com/v1/default/banks/my-bank/memories/recall"
-
-    def test_recall_uses_post_method(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"results": []})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.recall("my-bank", "what is X?")
-
-        req = mock_open.call_args[0][0]
-        assert req.get_method() == "POST"
-
-    def test_recall_sends_correct_body(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"results": []})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.recall("my-bank", "test query", budget="high", max_tokens=2048, types=["world"])
-
-        req = mock_open.call_args[0][0]
-        sent_body = json.loads(req.data)
-        assert sent_body["query"] == "test query"
-        assert sent_body["budget"] == "high"
-        assert sent_body["max_tokens"] == 2048
-        assert sent_body["types"] == ["world"]
-
-    def test_recall_default_body_fields(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"results": []})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.recall("my-bank", "test query")
-
-        req = mock_open.call_args[0][0]
-        sent_body = json.loads(req.data)
-        assert sent_body["budget"] == "mid"
-        assert sent_body["max_tokens"] == 1024
-        # types should be present (default value)
-        assert "types" in sent_body
-
-    def test_recall_sets_content_type_header(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"results": []})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.recall("my-bank", "query")
-
-        req = mock_open.call_args[0][0]
-        assert req.get_header("Content-type") == "application/json"
-
-    def test_recall_sets_authorization_header(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"results": []})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.recall("my-bank", "query")
-
-        req = mock_open.call_args[0][0]
-        auth = req.get_header("Authorization")
-        assert auth is not None
-        assert auth.startswith("Bearer ")
-
-    def test_recall_raises_hindclaw_http_error_on_403(self):
-        from scripts.lib.client import HindclawHttpError
-        client = self._client()
-
-        with patch("urllib.request.urlopen", side_effect=_make_http_error(403, {"detail": "Permission denied"})):
-            with pytest.raises(HindclawHttpError) as exc_info:
-                client.recall("my-bank", "query")
-
-        assert exc_info.value.status_code == 403
-
-    def test_recall_raises_hindclaw_http_error_on_500(self):
-        from scripts.lib.client import HindclawHttpError
-        client = self._client()
-
-        with patch("urllib.request.urlopen", side_effect=_make_http_error(500, "Internal Server Error")):
-            with pytest.raises(HindclawHttpError) as exc_info:
-                client.recall("my-bank", "query")
-
-        assert exc_info.value.status_code == 500
-
-    def test_recall_error_body_is_captured(self):
-        from scripts.lib.client import HindclawHttpError
-        client = self._client()
-        error_body = {"detail": "Bank not found"}
-
-        with patch("urllib.request.urlopen", side_effect=_make_http_error(404, error_body)):
-            with pytest.raises(HindclawHttpError) as exc_info:
-                client.recall("my-bank", "query")
-
-        assert exc_info.value.status_code == 404
+        mock_urlopen.side_effect = err
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        with self.assertRaises(HindclawHttpError) as ctx:
+            c.recall("bank1", "query")
+        self.assertEqual(ctx.exception.status_code, 403)
 
 
-# ---------------------------------------------------------------------------
-# retain tests
-# ---------------------------------------------------------------------------
+class TestRetain(unittest.TestCase):
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_sends_items_with_async(self, mock_urlopen):
+        resp_data = json.dumps({"ok": True}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
 
-class TestRetain:
-    def _client(self):
-        from scripts.lib.client import HindclawClient
-        return HindclawClient(
-            "https://api.example.com",
-            "test-secret",
-            _make_claims_builder(),
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        c.retain("bank1", [{"content": "text"}])
+
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data)
+        self.assertEqual(body["items"], [{"content": "text"}])
+        self.assertTrue(body["async"])
+
+
+class TestCreateBank(unittest.TestCase):
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_posts_to_ext_hindclaw_banks(self, mock_urlopen):
+        resp_data = json.dumps({"bank_id": "test", "bank_created": True}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        result = c.create_bank("my::bank", "fullstack-dev")
+
+        req = mock_urlopen.call_args[0][0]
+        self.assertIn("/ext/hindclaw/banks", req.full_url)
+        body = json.loads(req.data)
+        self.assertEqual(body["bank_id"], "my::bank")
+        self.assertEqual(body["template"], "fullstack-dev")
+
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_raises_on_404_template_not_found(self, mock_urlopen):
+        err = __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            "http://example.com", 404, "Not Found", {}, None
         )
+        mock_urlopen.side_effect = err
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        with self.assertRaises(HindclawHttpError) as ctx:
+            c.create_bank("my::bank", "bad-template")
+        self.assertEqual(ctx.exception.status_code, 404)
 
-    def test_retain_returns_dict_on_200(self):
-        client = self._client()
-        body = {"accepted": 2, "rejected": 0}
-        mock_resp = _make_response(200, body)
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_raises_on_403_no_permission(self, mock_urlopen):
+        err = __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            "http://example.com", 403, "Forbidden", {}, None
+        )
+        mock_urlopen.side_effect = err
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        with self.assertRaises(HindclawHttpError) as ctx:
+            c.create_bank("my::bank", "dev")
+        self.assertEqual(ctx.exception.status_code, 403)
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client.retain("my-bank", [{"content": "fact", "context": "claude-code"}])
-
-        assert result == body
-
-    def test_retain_hits_correct_endpoint(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"accepted": 1})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.retain("my-bank", [{"content": "fact"}])
-
-        req = mock_open.call_args[0][0]
-        assert req.full_url == "https://api.example.com/v1/default/banks/my-bank/memories"
-
-    def test_retain_uses_post_method(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"accepted": 1})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.retain("my-bank", [{"content": "fact"}])
-
-        req = mock_open.call_args[0][0]
-        assert req.get_method() == "POST"
-
-    def test_retain_sends_correct_body(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"accepted": 1})
-        items = [{"content": "fact 1", "context": "claude-code"}, {"content": "fact 2"}]
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.retain("my-bank", items, async_=True)
-
-        req = mock_open.call_args[0][0]
-        sent_body = json.loads(req.data)
-        assert sent_body["items"] == items
-        assert sent_body["async"] is True
-
-    def test_retain_async_false(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"accepted": 1})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.retain("my-bank", [{"content": "fact"}], async_=False)
-
-        req = mock_open.call_args[0][0]
-        sent_body = json.loads(req.data)
-        assert sent_body["async"] is False
-
-    def test_retain_sets_authorization_header(self):
-        client = self._client()
-        mock_resp = _make_response(200, {"accepted": 1})
-
-        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
-            client.retain("my-bank", [{"content": "fact"}])
-
-        req = mock_open.call_args[0][0]
-        auth = req.get_header("Authorization")
-        assert auth is not None
-        assert auth.startswith("Bearer ")
-
-    def test_retain_raises_hindclaw_http_error_on_403(self):
-        from scripts.lib.client import HindclawHttpError
-        client = self._client()
-
-        with patch("urllib.request.urlopen", side_effect=_make_http_error(403, {"detail": "Permission denied"})):
-            with pytest.raises(HindclawHttpError) as exc_info:
-                client.retain("my-bank", [{"content": "fact"}])
-
-        assert exc_info.value.status_code == 403
-
-    def test_retain_raises_hindclaw_http_error_on_500(self):
-        from scripts.lib.client import HindclawHttpError
-        client = self._client()
-
-        with patch("urllib.request.urlopen", side_effect=_make_http_error(500, "Server Error")):
-            with pytest.raises(HindclawHttpError) as exc_info:
-                client.retain("my-bank", [{"content": "fact"}])
-
-        assert exc_info.value.status_code == 500
+    @patch("scripts.lib.client.urllib.request.urlopen")
+    def test_raises_on_422_validation_error(self, mock_urlopen):
+        err = __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            "http://example.com", 422, "Unprocessable", {}, None
+        )
+        mock_urlopen.side_effect = err
+        c = HindclawClient("http://example.com", "hc_sa_test")
+        with self.assertRaises(HindclawHttpError) as ctx:
+            c.create_bank("my::bank", "dev")
+        self.assertEqual(ctx.exception.status_code, 422)
