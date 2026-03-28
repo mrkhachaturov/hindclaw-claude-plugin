@@ -2,7 +2,7 @@
 
 Flow:
   1. Read hook input JSON from stdin (session_id, cwd, transcript_path).
-  2. Load config, check guards: autoRetain, healthy, bank not denied.
+  2. Load config, check guards: autoRetain, healthy, bankId, credentials.
   3. Read full transcript from transcript_path JSONL via read_transcript().
   4. If transcript empty → exit.
   5. Increment turn count via state.increment_turn(session_id).
@@ -13,11 +13,12 @@ Flow:
   8. Prepare retention transcript via content.prepare_retention_transcript()
      with role filtering and retain_full_window=True.
   9. If chunk empty → exit.
- 10. Build JWT claims, create client.
+ 10. Create HindclawClient with API key auth.
  11. Build items array: [{"content": transcript_text, "context": retainContext}].
  12. Call client.retain(bank_id, items, async_=True).
- 13. On 403 → log warning, add to denied_banks.
-    On other error → log to stderr.
+ 13. On 404 → attempt bank creation from template, then retry retain.
+     On 401/403 → mark_unhealthy (user notified on next recall via systemMessage).
+     On other error → log to stderr.
  14. Exit (no stdout output — Stop hook is fire-and-forget).
 """
 
@@ -32,26 +33,10 @@ _project_root = os.path.dirname(_scripts_dir)
 sys.path.insert(0, _scripts_dir)
 sys.path.insert(0, _project_root)
 
-from lib.auth import build_claims  # noqa: E402
 from lib.client import HindclawClient, HindclawHttpError  # noqa: E402
 from lib.config import debug_log, load_config  # noqa: E402
 from lib.content import prepare_retention_transcript, slice_last_turns_by_user_boundary  # noqa: E402
-from lib.state import add_denied_bank, increment_turn, is_bank_denied, is_healthy  # noqa: E402
-
-
-def make_claims_builder(config: dict, hook_input: dict):
-    """Return a closure that builds JWT claims for this session.
-
-    Args:
-        config: Merged plugin config with userId, agentName, clientId.
-        hook_input: Claude Code hook input with session_id.
-
-    Returns:
-        Callable that returns a fresh claims dict each time it is called.
-    """
-    def claims_builder() -> dict:
-        return build_claims(config, hook_input)
-    return claims_builder
+from lib.state import increment_turn, is_healthy, mark_unhealthy, read_session_state, set_flag  # noqa: E402
 
 
 def read_transcript(transcript_path: str) -> list:
@@ -134,16 +119,11 @@ def main() -> None:
         debug_log(config, "retain: no bankId resolved, skipping")
         return
 
-    # Guard 4: bank denied this session
-    if is_bank_denied(session_id, bank_id):
-        debug_log(config, "retain: bank denied, skipping", bank_id)
-        return
-
-    # Guard 5: need API URL + JWT secret
+    # Guard 4: need API URL + API key
     api_url = config.get("hindsightApiUrl", "")
-    jwt_secret = config.get("jwtSecret", "")
-    if not api_url or not jwt_secret:
-        debug_log(config, "retain: missing hindsightApiUrl or jwtSecret, skipping")
+    api_key = config.get("apiKey", "")
+    if not api_url or not api_key:
+        debug_log(config, "retain: missing hindsightApiUrl or apiKey, skipping")
         return
 
     # Read transcript
@@ -185,11 +165,7 @@ def main() -> None:
     debug_log(config, f"retain: prepared {part_count} parts, len={len(transcript_text)}")
 
     # Build client
-    client = HindclawClient(
-        api_url=api_url,
-        jwt_secret=jwt_secret,
-        claims_builder=make_claims_builder(config, hook_input),
-    )
+    client = HindclawClient(api_url=api_url, api_key=api_key)
 
     retain_context = config.get("retainContext", "")
     items = [{"content": transcript_text, "context": retain_context}]
@@ -198,17 +174,65 @@ def main() -> None:
         client.retain(bank_id, items, async_=True)
         debug_log(config, f"retain: submitted {part_count} parts to bank {bank_id!r}")
     except HindclawHttpError as exc:
-        if exc.status_code == 403:
-            print(
-                f"[HindClaw] retain: bank {bank_id!r} denied (403), skipping future retains",
-                file=sys.stderr,
-            )
-            add_denied_bank(session_id, bank_id)
+        if exc.status_code == 404:
+            # Bank doesn't exist — try creating from template
+            template = config.get("template")
+            state = read_session_state(session_id)
+            if not template:
+                print(
+                    f"[HindClaw] retain: bank {bank_id!r} not found. "
+                    f"Set 'template' in config to auto-create.",
+                    file=sys.stderr,
+                )
+                mark_unhealthy(session_id)
+                return
+            if state.get("bank_created"):
+                # Already tried creating this session — don't retry
+                print(f"[HindClaw] retain: bank creation already attempted, skipping", file=sys.stderr)
+                mark_unhealthy(session_id)
+                return
+            # Attempt bank creation
+            try:
+                client.create_bank(bank_id, template)
+                set_flag(session_id, "bank_created", True)
+                debug_log(config, f"retain: created bank {bank_id!r} from template {template!r}")
+                # Retry the retain
+                try:
+                    client.retain(bank_id, items, async_=True)
+                    debug_log(config, f"retain: retry successful for bank {bank_id!r}")
+                except Exception as retry_exc:
+                    print(f"[HindClaw] retain: retry after bank creation failed: {retry_exc}", file=sys.stderr)
+            except HindclawHttpError as create_exc:
+                if create_exc.status_code == 409:
+                    # Bank already exists (created by another session) — just retry retain
+                    set_flag(session_id, "bank_created", True)
+                    debug_log(config, f"retain: bank {bank_id!r} already exists (409), retrying retain")
+                    try:
+                        client.retain(bank_id, items, async_=True)
+                        debug_log(config, f"retain: retry successful for bank {bank_id!r}")
+                    except Exception as retry_exc:
+                        print(f"[HindClaw] retain: retry after 409 failed: {retry_exc}", file=sys.stderr)
+                elif create_exc.status_code == 403:
+                    print(f"[HindClaw] retain: no permission to create bank (403)", file=sys.stderr)
+                    mark_unhealthy(session_id)
+                elif create_exc.status_code == 404:
+                    print(f"[HindClaw] retain: template {template!r} not found on server", file=sys.stderr)
+                    mark_unhealthy(session_id)
+                elif create_exc.status_code == 422:
+                    print(f"[HindClaw] retain: bank creation validation error: {create_exc.body}", file=sys.stderr)
+                    mark_unhealthy(session_id)
+                else:
+                    print(f"[HindClaw] retain: bank creation failed ({create_exc.status_code}): {create_exc.body}", file=sys.stderr)
+                    mark_unhealthy(session_id)
+            except Exception as create_exc:
+                print(f"[HindClaw] retain: bank creation error: {create_exc}", file=sys.stderr)
+                mark_unhealthy(session_id)
             return
-        print(
-            f"[HindClaw] retain: HTTP error {exc.status_code}: {exc.body}",
-            file=sys.stderr,
-        )
+        if exc.status_code in (401, 403):
+            print(f"[HindClaw] retain: access denied ({exc.status_code}), marking unhealthy", file=sys.stderr)
+            mark_unhealthy(session_id)
+            return
+        print(f"[HindClaw] retain: HTTP error {exc.status_code}: {exc.body}", file=sys.stderr)
         return
     except Exception as exc:
         print(f"[HindClaw] retain: unexpected error: {exc}", file=sys.stderr)
