@@ -1,0 +1,12 @@
+{
+  "name": "hindclaw-claude-plugin",
+  "description": "Long-term memory for Claude Code via Hindsight with HindClaw access control",
+  "version": "0.2.0",
+  "author": {
+    "name": "Ruben Khachaturov",
+    "url": "https://hindclaw.pro"
+  },
+  "repository": "https://github.com/mrkhachaturov/hindclaw-claude-plugin",
+  "license": "MIT",
+  "keywords": ["memory", "hindsight", "hindclaw", "recall", "retain"]
+}
