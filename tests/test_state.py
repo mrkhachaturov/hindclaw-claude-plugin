@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import unittest
 import pytest
 from unittest.mock import patch
 
@@ -12,6 +13,37 @@ from unittest.mock import patch
 def _with_state_dir(tmp_path):
     """Return env patch dict pointing CLAUDE_PLUGIN_DATA at tmp_path."""
     return {"CLAUDE_PLUGIN_DATA": str(tmp_path)}
+
+
+_DEFAULT = {
+    "healthy": True,
+    "turn_count": 0,
+    "error_notified": False,
+    "config_warned": False,
+    "bank_created": False,
+}
+
+
+# ---------------------------------------------------------------------------
+# _default_state
+# ---------------------------------------------------------------------------
+
+class TestDefaultState(unittest.TestCase):
+    def test_default_state_has_all_fields(self):
+        from scripts.lib.state import _default_state
+        state = _default_state()
+        self.assertEqual(state, {
+            "healthy": True,
+            "turn_count": 0,
+            "error_notified": False,
+            "config_warned": False,
+            "bank_created": False,
+        })
+
+    def test_no_denied_banks_field(self):
+        from scripts.lib.state import _default_state
+        state = _default_state()
+        self.assertNotIn("denied_banks", state)
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +154,11 @@ class TestReadWriteSessionState:
         from scripts.lib.state import read_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
             state = read_session_state("nonexistent-session")
-        assert state == {"healthy": True, "denied_banks": [], "turn_count": 0}
+        assert state == _DEFAULT
 
     def test_write_then_read_roundtrip(self, tmp_path):
         from scripts.lib.state import read_session_state, write_session_state
-        data = {"healthy": True, "denied_banks": ["bank1"], "turn_count": 5}
+        data = {"healthy": True, "turn_count": 5, "error_notified": True, "config_warned": False, "bank_created": False}
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
             write_session_state("sess-001", data)
             result = read_session_state("sess-001")
@@ -134,7 +166,7 @@ class TestReadWriteSessionState:
 
     def test_write_creates_json_file(self, tmp_path):
         from scripts.lib.state import write_session_state
-        data = {"healthy": False, "denied_banks": [], "turn_count": 0}
+        data = {"healthy": False, "turn_count": 0, "error_notified": False, "config_warned": False, "bank_created": False}
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
             write_session_state("sess-write-test", data)
         state_file = tmp_path / "state" / "sess-write-test.json"
@@ -144,7 +176,7 @@ class TestReadWriteSessionState:
     def test_write_is_atomic_no_tmp_left_behind(self, tmp_path):
         from scripts.lib.state import write_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("sess-atomic", {"healthy": True, "denied_banks": [], "turn_count": 0})
+            write_session_state("sess-atomic", _DEFAULT)
         state_dir = tmp_path / "state"
         tmp_files = list(state_dir.glob("*.tmp"))
         assert tmp_files == []
@@ -156,16 +188,17 @@ class TestReadWriteSessionState:
         (state_dir / "corrupt-sess.json").write_text("not valid json {{{")
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
             result = read_session_state("corrupt-sess")
-        assert result == {"healthy": True, "denied_banks": [], "turn_count": 0}
+        assert result == _DEFAULT
 
     def test_overwrite_updates_data(self, tmp_path):
         from scripts.lib.state import read_session_state, write_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("sess-over", {"healthy": True, "denied_banks": [], "turn_count": 1})
-            write_session_state("sess-over", {"healthy": False, "denied_banks": ["b1"], "turn_count": 2})
+            write_session_state("sess-over", {"healthy": True, "turn_count": 1, "error_notified": False, "config_warned": False, "bank_created": False})
+            write_session_state("sess-over", {"healthy": False, "turn_count": 2, "error_notified": True, "config_warned": False, "bank_created": True})
             result = read_session_state("sess-over")
         assert result["healthy"] is False
-        assert result["denied_banks"] == ["b1"]
+        assert result["error_notified"] is True
+        assert result["bank_created"] is True
         assert result["turn_count"] == 2
 
 
@@ -177,30 +210,29 @@ class TestSessionIsolation:
     def test_two_sessions_do_not_interfere(self, tmp_path):
         from scripts.lib.state import read_session_state, write_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("sess-A", {"healthy": True, "denied_banks": ["bank-a"], "turn_count": 3})
-            write_session_state("sess-B", {"healthy": False, "denied_banks": ["bank-b"], "turn_count": 7})
+            write_session_state("sess-A", {"healthy": True, "turn_count": 3, "error_notified": False, "config_warned": False, "bank_created": False})
+            write_session_state("sess-B", {"healthy": False, "turn_count": 7, "error_notified": True, "config_warned": False, "bank_created": False})
 
             state_a = read_session_state("sess-A")
             state_b = read_session_state("sess-B")
 
-        assert state_a["denied_banks"] == ["bank-a"]
         assert state_a["turn_count"] == 3
-        assert state_b["denied_banks"] == ["bank-b"]
         assert state_b["turn_count"] == 7
         assert state_a["healthy"] is True
         assert state_b["healthy"] is False
+        assert state_b["error_notified"] is True
 
     def test_write_to_one_session_does_not_affect_other(self, tmp_path):
         from scripts.lib.state import read_session_state, write_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("sess-X", {"healthy": True, "denied_banks": [], "turn_count": 0})
-            write_session_state("sess-Y", {"healthy": True, "denied_banks": [], "turn_count": 0})
+            write_session_state("sess-X", _DEFAULT.copy())
+            write_session_state("sess-Y", _DEFAULT.copy())
 
-            write_session_state("sess-X", {"healthy": False, "denied_banks": ["bx"], "turn_count": 10})
+            write_session_state("sess-X", {"healthy": False, "turn_count": 10, "error_notified": True, "config_warned": False, "bank_created": False})
 
             state_y = read_session_state("sess-Y")
 
-        assert state_y == {"healthy": True, "denied_banks": [], "turn_count": 0}
+        assert state_y == _DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +243,7 @@ class TestDeleteSessionState:
     def test_delete_removes_state_file(self, tmp_path):
         from scripts.lib.state import write_session_state, delete_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("sess-del", {"healthy": True, "denied_banks": [], "turn_count": 0})
+            write_session_state("sess-del", _DEFAULT.copy())
             delete_session_state("sess-del")
         state_file = tmp_path / "state" / "sess-del.json"
         assert not state_file.exists()
@@ -225,8 +257,8 @@ class TestDeleteSessionState:
     def test_delete_only_removes_targeted_session(self, tmp_path):
         from scripts.lib.state import write_session_state, delete_session_state, read_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("sess-keep", {"healthy": True, "denied_banks": [], "turn_count": 1})
-            write_session_state("sess-gone", {"healthy": True, "denied_banks": [], "turn_count": 2})
+            write_session_state("sess-keep", {"healthy": True, "turn_count": 1, "error_notified": False, "config_warned": False, "bank_created": False})
+            write_session_state("sess-gone", {"healthy": True, "turn_count": 2, "error_notified": False, "config_warned": False, "bank_created": False})
             delete_session_state("sess-gone")
             kept = read_session_state("sess-keep")
         assert kept["turn_count"] == 1
@@ -234,10 +266,10 @@ class TestDeleteSessionState:
     def test_read_after_delete_returns_default(self, tmp_path):
         from scripts.lib.state import write_session_state, delete_session_state, read_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("sess-cycle", {"healthy": False, "denied_banks": ["b"], "turn_count": 99})
+            write_session_state("sess-cycle", {"healthy": False, "turn_count": 99, "error_notified": True, "config_warned": True, "bank_created": True})
             delete_session_state("sess-cycle")
             result = read_session_state("sess-cycle")
-        assert result == {"healthy": True, "denied_banks": [], "turn_count": 0}
+        assert result == _DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -316,43 +348,6 @@ class TestIncrementTurn:
 
 
 # ---------------------------------------------------------------------------
-# add_denied_bank
-# ---------------------------------------------------------------------------
-
-class TestAddDeniedBank:
-    def test_add_single_bank(self, tmp_path):
-        from scripts.lib.state import add_denied_bank, read_session_state
-        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            add_denied_bank("sess-deny", "bank-alpha")
-            state = read_session_state("sess-deny")
-        assert "bank-alpha" in state["denied_banks"]
-
-    def test_add_multiple_banks(self, tmp_path):
-        from scripts.lib.state import add_denied_bank, read_session_state
-        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            add_denied_bank("sess-multi-deny", "bank-1")
-            add_denied_bank("sess-multi-deny", "bank-2")
-            add_denied_bank("sess-multi-deny", "bank-3")
-            state = read_session_state("sess-multi-deny")
-        assert state["denied_banks"] == ["bank-1", "bank-2", "bank-3"]
-
-    def test_add_duplicate_bank_not_duplicated(self, tmp_path):
-        from scripts.lib.state import add_denied_bank, read_session_state
-        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            add_denied_bank("sess-dedup", "bank-x")
-            add_denied_bank("sess-dedup", "bank-x")
-            state = read_session_state("sess-dedup")
-        assert state["denied_banks"].count("bank-x") == 1
-
-    def test_add_bank_isolated_per_session(self, tmp_path):
-        from scripts.lib.state import add_denied_bank, read_session_state
-        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            add_denied_bank("sess-deny-a", "bank-a")
-            state_b = read_session_state("sess-deny-b")
-        assert state_b["denied_banks"] == []
-
-
-# ---------------------------------------------------------------------------
 # is_healthy
 # ---------------------------------------------------------------------------
 
@@ -365,40 +360,95 @@ class TestIsHealthy:
     def test_unhealthy_after_write(self, tmp_path):
         from scripts.lib.state import is_healthy, write_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("sick-sess", {"healthy": False, "denied_banks": [], "turn_count": 0})
+            write_session_state("sick-sess", {"healthy": False, "turn_count": 0, "error_notified": False, "config_warned": False, "bank_created": False})
             assert is_healthy("sick-sess") is False
 
     def test_healthy_after_write(self, tmp_path):
         from scripts.lib.state import is_healthy, write_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            write_session_state("healthy-sess", {"healthy": True, "denied_banks": [], "turn_count": 5})
+            write_session_state("healthy-sess", {"healthy": True, "turn_count": 5, "error_notified": False, "config_warned": False, "bank_created": False})
             assert is_healthy("healthy-sess") is True
 
 
 # ---------------------------------------------------------------------------
-# is_bank_denied
+# set_flag
 # ---------------------------------------------------------------------------
 
-class TestIsBankDenied:
-    def test_not_denied_by_default(self, tmp_path):
-        from scripts.lib.state import is_bank_denied
+class TestSetFlag:
+    def test_sets_error_notified(self, tmp_path):
+        from scripts.lib.state import set_flag, read_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            assert is_bank_denied("fresh-sess", "some-bank") is False
+            set_flag("sess-flag-en", "error_notified", True)
+            state = read_session_state("sess-flag-en")
+        assert state["error_notified"] is True
 
-    def test_denied_after_add(self, tmp_path):
-        from scripts.lib.state import is_bank_denied, add_denied_bank
+    def test_sets_config_warned(self, tmp_path):
+        from scripts.lib.state import set_flag, read_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            add_denied_bank("sess-check", "forbidden-bank")
-            assert is_bank_denied("sess-check", "forbidden-bank") is True
+            set_flag("sess-flag-cw", "config_warned", True)
+            state = read_session_state("sess-flag-cw")
+        assert state["config_warned"] is True
 
-    def test_other_bank_not_denied(self, tmp_path):
-        from scripts.lib.state import is_bank_denied, add_denied_bank
+    def test_sets_bank_created(self, tmp_path):
+        from scripts.lib.state import set_flag, read_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            add_denied_bank("sess-other", "denied-bank")
-            assert is_bank_denied("sess-other", "allowed-bank") is False
+            set_flag("sess-flag-bc", "bank_created", True)
+            state = read_session_state("sess-flag-bc")
+        assert state["bank_created"] is True
 
-    def test_bank_denial_isolated_per_session(self, tmp_path):
-        from scripts.lib.state import is_bank_denied, add_denied_bank
+    def test_set_flag_false(self, tmp_path):
+        from scripts.lib.state import set_flag, read_session_state, write_session_state
         with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
-            add_denied_bank("sess-deny-iso-a", "shared-bank")
-            assert is_bank_denied("sess-deny-iso-b", "shared-bank") is False
+            write_session_state("sess-flag-false", {"healthy": True, "turn_count": 0, "error_notified": True, "config_warned": True, "bank_created": True})
+            set_flag("sess-flag-false", "error_notified", False)
+            state = read_session_state("sess-flag-false")
+        assert state["error_notified"] is False
+        # Other flags not touched
+        assert state["config_warned"] is True
+
+    def test_set_flag_does_not_clobber_other_fields(self, tmp_path):
+        from scripts.lib.state import set_flag, read_session_state
+        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
+            set_flag("sess-flag-nc", "error_notified", True)
+            state = read_session_state("sess-flag-nc")
+        # turn_count and other flags should be at default values
+        assert state["turn_count"] == 0
+        assert state["config_warned"] is False
+        assert state["bank_created"] is False
+        assert state["healthy"] is True
+
+    def test_set_healthy_flag(self, tmp_path):
+        from scripts.lib.state import set_flag, is_healthy
+        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
+            set_flag("sess-flag-h", "healthy", False)
+            assert is_healthy("sess-flag-h") is False
+
+
+# ---------------------------------------------------------------------------
+# mark_unhealthy
+# ---------------------------------------------------------------------------
+
+class TestMarkUnhealthy:
+    def test_marks_session_unhealthy(self, tmp_path):
+        from scripts.lib.state import mark_unhealthy, read_session_state
+        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
+            mark_unhealthy("sess-mu")
+            state = read_session_state("sess-mu")
+        assert state["healthy"] is False
+
+    def test_is_healthy_returns_false_after_mark(self, tmp_path):
+        from scripts.lib.state import mark_unhealthy, is_healthy
+        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
+            assert is_healthy("sess-mu2") is True
+            mark_unhealthy("sess-mu2")
+            assert is_healthy("sess-mu2") is False
+
+    def test_mark_unhealthy_does_not_clobber_other_fields(self, tmp_path):
+        from scripts.lib.state import mark_unhealthy, increment_turn, read_session_state
+        with patch.dict(os.environ, _with_state_dir(tmp_path), clear=False):
+            increment_turn("sess-mu3")
+            increment_turn("sess-mu3")
+            mark_unhealthy("sess-mu3")
+            state = read_session_state("sess-mu3")
+        assert state["healthy"] is False
+        assert state["turn_count"] == 2

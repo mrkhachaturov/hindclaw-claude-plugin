@@ -21,7 +21,13 @@ _thread_lock = threading.Lock()
 
 def _default_state() -> dict:
     """Return a fresh default session state dict."""
-    return {"healthy": True, "denied_banks": [], "turn_count": 0}
+    return {
+        "healthy": True,
+        "turn_count": 0,
+        "error_notified": False,
+        "config_warned": False,
+        "bank_created": False,
+    }
 
 
 def _state_dir() -> str:
@@ -96,7 +102,7 @@ def read_session_state(session_id: str) -> dict:
         session_id: Session identifier.
 
     Returns:
-        State dict with keys healthy, denied_banks, turn_count.
+        State dict with keys healthy, turn_count, error_notified, config_warned, bank_created.
     """
     path = _state_file(session_id)
     if not os.path.exists(path):
@@ -171,15 +177,13 @@ def increment_turn(session_id: str) -> int:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
-def add_denied_bank(session_id: str, bank_id: str) -> None:
-    """Add a bank to the denied list for a session (idempotent).
-
-    Uses both a threading.Lock (same-process threads) and fcntl.flock (cross-process
-    concurrent hook invocations) to prevent concurrent modifications.
+def set_flag(session_id: str, flag: str, value: bool) -> None:
+    """Atomically set a boolean flag in session state.
 
     Args:
         session_id: Session identifier.
-        bank_id: Bank identifier to deny.
+        flag: Flag name (error_notified, config_warned, bank_created).
+        value: Boolean value to set.
     """
     path = _state_file(session_id)
     lock_path = path + ".lock"
@@ -188,13 +192,15 @@ def add_denied_bank(session_id: str, bank_id: str) -> None:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
                 state = read_session_state(session_id)
-                denied = state.get("denied_banks", [])
-                if bank_id not in denied:
-                    denied.append(bank_id)
-                    state["denied_banks"] = denied
-                    write_session_state(session_id, state)
+                state[flag] = value
+                write_session_state(session_id, state)
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def mark_unhealthy(session_id: str) -> None:
+    """Mark session as unhealthy. All hooks will skip."""
+    set_flag(session_id, "healthy", False)
 
 
 def is_healthy(session_id: str) -> bool:
@@ -210,15 +216,3 @@ def is_healthy(session_id: str) -> bool:
     return bool(state.get("healthy", True))
 
 
-def is_bank_denied(session_id: str, bank_id: str) -> bool:
-    """Return whether a bank has been denied for this session.
-
-    Args:
-        session_id: Session identifier.
-        bank_id: Bank identifier to check.
-
-    Returns:
-        True if bank_id is in the denied_banks list, False otherwise.
-    """
-    state = read_session_state(session_id)
-    return bank_id in state.get("denied_banks", [])
