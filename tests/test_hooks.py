@@ -1,9 +1,12 @@
 """End-to-end integration tests for the HindClaw Claude Code hook scripts.
 
 Imports each hook module in-process via importlib and mocks stdin/stdout/HTTP
-using unittest.mock.patch — the same technique as upstream test_hooks.py.
+using unittest.mock.patch -- the same technique as upstream test_hooks.py.
 subprocess.run() is deliberately avoided: monkeypatching does not cross process
 boundaries.
+
+All tests use API key auth (no JWT). The v2 state shape is:
+  {healthy, turn_count, error_notified, config_warned, bank_created}
 """
 
 import importlib.util
@@ -67,6 +70,30 @@ def make_http_error(status, body=None):
 
 
 # ---
+# Default settings
+# ---
+
+_DEFAULT_SETTINGS = {
+    "hindsightApiUrl": "http://fake:9077",
+    "apiKey": "hc_sa_test_key_000",
+    "bankId": "test-bank",
+    "template": None,
+    "autoRecall": True,
+    "autoRetain": True,
+    "retainEveryNTurns": 1,
+    "retainOverlapTurns": 1,
+    "retainContext": "claude-code",
+    "retainRoles": ["user", "assistant"],
+    "recallBudget": "mid",
+    "recallMaxTokens": 1024,
+    "recallContextTurns": 1,
+    "recallMaxQueryChars": 800,
+    "recallTopK": None,
+    "debug": False,
+}
+
+
+# ---
 # Core runner
 # ---
 
@@ -95,15 +122,7 @@ def _run_hook(module_name, hook_input, tmp_path, urlopen_side_effect=None, extra
     plugin_root.mkdir(exist_ok=True)
     plugin_data.mkdir(exist_ok=True)
 
-    settings = {
-        "autoRecall": True,
-        "autoRetain": True,
-        "retainEveryNTurns": 1,
-        "hindsightApiUrl": "http://fake:9077",
-        "jwtSecret": "test-secret",
-        "userId": "test@test.com",
-        "agentName": "test-project",
-    }
+    settings = dict(_DEFAULT_SETTINGS)
     if extra_settings:
         settings.update(extra_settings)
     (plugin_root / "settings.json").write_text(json.dumps(settings))
@@ -143,19 +162,149 @@ def _run_hook(module_name, hook_input, tmp_path, urlopen_side_effect=None, extra
     return stdout_capture.getvalue(), stderr_capture.getvalue()
 
 
+def _read_state(tmp_path, session_id):
+    """Read the persisted state JSON for a session.
+
+    Returns the parsed dict or None if the file does not exist.
+    """
+    state_file = tmp_path / "plugin_data" / "state" / f"{session_id}.json"
+    if state_file.exists():
+        return json.loads(state_file.read_text())
+    return None
+
+
+def _write_state(tmp_path, session_id, state):
+    """Pre-create a session state file for hooks that read it."""
+    state_dir = tmp_path / "plugin_data" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir / f"{session_id}.json"
+    state_file.write_text(json.dumps(state))
+
+
+def _make_transcript_jsonl(tmp_path, messages):
+    """Write a JSONL transcript in Claude Code nested format.
+
+    Args:
+        tmp_path: Directory to write the transcript file into.
+        messages: List of ``{"role": str, "content": str}`` dicts.
+
+    Returns:
+        Absolute path string of the created transcript file.
+    """
+    transcript_file = tmp_path / "transcript.jsonl"
+    lines = []
+    for msg in messages:
+        entry = {"type": msg["role"], "message": {"role": msg["role"], "content": msg["content"]}}
+        lines.append(json.dumps(entry))
+    transcript_file.write_text("\n".join(lines))
+    return str(transcript_file)
+
+
+# ---
+# TestSessionStartHook
+# ---
+
+
+class TestSessionStartHook:
+    def test_missing_api_key_outputs_system_message(self, tmp_path):
+        """Missing apiKey -> systemMessage listing apiKey, state healthy: false."""
+        hook_input = {"session_id": "ses-start-nokey", "cwd": "/tmp/project"}
+
+        stdout, _ = _run_hook("session_start", hook_input, tmp_path,
+                              extra_settings={"apiKey": ""})
+
+        assert stdout, "Expected systemMessage output when apiKey is missing"
+        parsed = json.loads(stdout)
+        assert "systemMessage" in parsed
+        assert "apiKey" in parsed["systemMessage"]
+
+        state = _read_state(tmp_path, "ses-start-nokey")
+        assert state is not None
+        assert state["healthy"] is False
+
+    def test_missing_bank_id_outputs_system_message(self, tmp_path):
+        """Missing bankId -> systemMessage mentioning bankId."""
+        hook_input = {"session_id": "ses-start-nobank", "cwd": "/tmp/project"}
+
+        stdout, _ = _run_hook("session_start", hook_input, tmp_path,
+                              extra_settings={"bankId": ""})
+
+        assert stdout, "Expected systemMessage output when bankId is missing"
+        parsed = json.loads(stdout)
+        assert "systemMessage" in parsed
+        assert "bankId" in parsed["systemMessage"]
+
+        state = _read_state(tmp_path, "ses-start-nobank")
+        assert state is not None
+        assert state["healthy"] is False
+
+    def test_health_check_passes_writes_healthy_state(self, tmp_path):
+        """Health check success -> state healthy: true, no systemMessage."""
+        hook_input = {"session_id": "ses-start-ok", "cwd": "/tmp/project"}
+
+        def urlopen_stub(*args, **kwargs):
+            return FakeHTTPResponse({"status": "ok"})
+
+        stdout, _ = _run_hook("session_start", hook_input, tmp_path,
+                              urlopen_side_effect=urlopen_stub)
+
+        state = _read_state(tmp_path, "ses-start-ok")
+        assert state is not None
+        assert state["healthy"] is True
+        assert state["turn_count"] == 0
+        assert state["error_notified"] is False
+        assert state["config_warned"] is False
+        assert state["bank_created"] is False
+
+        # No systemMessage on success
+        assert stdout == ""
+
+    def test_health_check_fails_writes_unhealthy_state_and_system_message(self, tmp_path):
+        """Health check failure -> state healthy: false, systemMessage output."""
+        hook_input = {"session_id": "ses-start-fail", "cwd": "/tmp/project"}
+
+        def urlopen_stub(*args, **kwargs):
+            raise OSError("Connection refused")
+
+        stdout, _ = _run_hook("session_start", hook_input, tmp_path,
+                              urlopen_side_effect=urlopen_stub)
+
+        state = _read_state(tmp_path, "ses-start-fail")
+        assert state is not None
+        assert state["healthy"] is False
+
+        assert stdout, "Expected systemMessage when health check fails"
+        parsed = json.loads(stdout)
+        assert "systemMessage" in parsed
+        assert "cannot reach" in parsed["systemMessage"]
+
+
 # ---
 # TestRecallHook
 # ---
 
 
 class TestRecallHook:
+    def _setup_healthy_session(self, tmp_path, session_id):
+        """Pre-create a healthy session state so recall does not skip."""
+        _write_state(tmp_path, session_id, {
+            "healthy": True,
+            "turn_count": 0,
+            "error_notified": False,
+            "config_warned": False,
+            "bank_created": False,
+        })
+
     def test_outputs_additional_context_when_memories_found(self, tmp_path):
-        """Recall with results returns hookSpecificOutput JSON."""
+        """Recall with results returns hookSpecificOutput JSON with hindsight_memories."""
+        session_id = "ses-recall-found"
+        self._setup_healthy_session(tmp_path, session_id)
+
         results = [{"text": "Paris is in France", "type": "world", "mentioned_at": "2025-01-01"}]
         response = FakeHTTPResponse({"results": results})
 
         hook_input = {
-            "session_id": "ses-recall-1",
+            "session_id": session_id,
             "cwd": "/tmp/project",
             "prompt": "What is the capital of France?",
         }
@@ -168,13 +317,17 @@ class TestRecallHook:
         assert "hookSpecificOutput" in parsed
         assert "additionalContext" in parsed["hookSpecificOutput"]
         assert "hindsight_memories" in parsed["hookSpecificOutput"]["additionalContext"]
+        assert parsed["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
 
     def test_no_output_when_no_memories(self, tmp_path):
         """Recall with empty results emits nothing to stdout."""
+        session_id = "ses-recall-empty"
+        self._setup_healthy_session(tmp_path, session_id)
+
         response = FakeHTTPResponse({"results": []})
 
         hook_input = {
-            "session_id": "ses-recall-2",
+            "session_id": session_id,
             "cwd": "/tmp/project",
             "prompt": "What is the capital of Germany?",
         }
@@ -184,87 +337,171 @@ class TestRecallHook:
 
         assert stdout == "", "Expected empty stdout when no memories returned"
 
-    def test_no_output_for_short_prompt(self, tmp_path):
-        """Prompt < 5 chars produces no output."""
+    def test_403_outputs_system_message_and_error_context(self, tmp_path):
+        """403 from recall -> systemMessage + additionalContext with hindsight_error,
+        state has error_notified: true and healthy: false."""
+        session_id = "ses-recall-403"
+        self._setup_healthy_session(tmp_path, session_id)
+
         hook_input = {
-            "session_id": "ses-recall-3",
+            "session_id": session_id,
             "cwd": "/tmp/project",
-            "prompt": "Hi",
+            "prompt": "What is the speed of light?",
         }
 
-        stdout, _ = _run_hook("recall", hook_input, tmp_path)
+        def raise_403(*a, **kw):
+            raise make_http_error(403, {"detail": "Forbidden"})
 
-        assert stdout == "", "Expected empty stdout for prompt shorter than 5 chars"
+        stdout, _ = _run_hook("recall", hook_input, tmp_path,
+                              urlopen_side_effect=raise_403)
 
-    def test_output_format_matches_claude_code_spec(self, tmp_path):
-        """Validates hookEventName and additionalContext keys."""
-        results = [{"text": "The sky is blue", "type": "world"}]
-        response = FakeHTTPResponse({"results": results})
+        assert stdout, "Expected output on 403"
+        parsed = json.loads(stdout)
+        assert "systemMessage" in parsed
+        assert "denied" in parsed["systemMessage"].lower() or "403" in parsed["systemMessage"]
+        assert "hookSpecificOutput" in parsed
+        assert "hindsight_error" in parsed["hookSpecificOutput"]["additionalContext"]
+
+        state = _read_state(tmp_path, session_id)
+        assert state["error_notified"] is True
+        assert state["healthy"] is False
+
+    def test_401_outputs_system_message_and_error_context(self, tmp_path):
+        """401 from recall -> same behavior as 403."""
+        session_id = "ses-recall-401"
+        self._setup_healthy_session(tmp_path, session_id)
 
         hook_input = {
-            "session_id": "ses-recall-4",
+            "session_id": session_id,
             "cwd": "/tmp/project",
-            "prompt": "Tell me something about the sky",
+            "prompt": "What is quantum mechanics?",
+        }
+
+        def raise_401(*a, **kw):
+            raise make_http_error(401, {"detail": "Unauthorized"})
+
+        stdout, _ = _run_hook("recall", hook_input, tmp_path,
+                              urlopen_side_effect=raise_401)
+
+        assert stdout, "Expected output on 401"
+        parsed = json.loads(stdout)
+        assert "systemMessage" in parsed
+        assert "hookSpecificOutput" in parsed
+        assert "hindsight_error" in parsed["hookSpecificOutput"]["additionalContext"]
+
+        state = _read_state(tmp_path, session_id)
+        assert state["error_notified"] is True
+        assert state["healthy"] is False
+
+    def test_recall_with_warnings_surfaces_system_message(self, tmp_path):
+        """Server warnings in response -> systemMessage with warning text,
+        memories in additionalContext, state has config_warned: true."""
+        session_id = "ses-recall-warn"
+        self._setup_healthy_session(tmp_path, session_id)
+
+        results = [{"text": "The sun is a star", "type": "world"}]
+        response_body = {
+            "results": results,
+            "warnings": ["budget 'ultra' capped to 'high'", "max_tokens 4096 capped to 2048"],
+        }
+        response = FakeHTTPResponse(response_body)
+
+        hook_input = {
+            "session_id": session_id,
+            "cwd": "/tmp/project",
+            "prompt": "Tell me about the sun",
         }
 
         stdout, _ = _run_hook("recall", hook_input, tmp_path,
                               urlopen_side_effect=lambda *a, **kw: response)
 
+        assert stdout, "Expected output when warnings present"
         parsed = json.loads(stdout)
-        hook_specific = parsed["hookSpecificOutput"]
-        assert hook_specific["hookEventName"] == "UserPromptSubmit"
-        assert isinstance(hook_specific["additionalContext"], str)
-        assert len(hook_specific["additionalContext"]) > 0
 
-    def test_empty_output_on_403(self, tmp_path):
-        """403 from recall -> no stdout, warning on stderr."""
+        # Should have both systemMessage (warning) and memories
+        assert "systemMessage" in parsed
+        assert "budget" in parsed["systemMessage"] or "capped" in parsed["systemMessage"]
+        assert "hookSpecificOutput" in parsed
+        assert "hindsight_memories" in parsed["hookSpecificOutput"]["additionalContext"]
+
+        state = _read_state(tmp_path, session_id)
+        assert state["config_warned"] is True
+
+    def test_unhealthy_session_skips_recall(self, tmp_path):
+        """Unhealthy session -> no API call, empty stdout."""
+        session_id = "ses-recall-unhealthy"
+        _write_state(tmp_path, session_id, {
+            "healthy": False,
+            "turn_count": 0,
+            "error_notified": False,
+            "config_warned": False,
+            "bank_created": False,
+        })
+
+        captured_calls = []
+
+        def capture_call(*args, **kwargs):
+            captured_calls.append(args)
+            return FakeHTTPResponse({"results": []})
+
         hook_input = {
-            "session_id": "ses-recall-5",
+            "session_id": session_id,
             "cwd": "/tmp/project",
-            "prompt": "What is the speed of light?",
+            "prompt": "What is the meaning of life?",
         }
-
-        stdout, stderr = _run_hook("recall", hook_input, tmp_path,
-                                   urlopen_side_effect=lambda *a, **kw: (_ for _ in ()).throw(
-                                       make_http_error(403, {"detail": "Forbidden"})
-                                   ))
-
-        assert stdout == "", "Expected empty stdout on 403"
-        assert "403" in stderr or "denied" in stderr.lower(), \
-            "Expected 403 or 'denied' in stderr warning"
-
-    def test_graceful_on_api_error(self, tmp_path):
-        """OSError degrades silently."""
-        hook_input = {
-            "session_id": "ses-recall-6",
-            "cwd": "/tmp/project",
-            "prompt": "What is the boiling point of water?",
-        }
-
-        def raise_os_error(*a, **kw):
-            raise OSError("Connection refused")
 
         stdout, _ = _run_hook("recall", hook_input, tmp_path,
-                              urlopen_side_effect=raise_os_error)
+                              urlopen_side_effect=capture_call)
 
-        assert stdout == "", "Expected empty stdout on OSError"
+        assert stdout == "", "Expected empty stdout for unhealthy session"
+        assert len(captured_calls) == 0, "No API call should be made for unhealthy session"
 
     def test_disabled_auto_recall_produces_no_output(self, tmp_path):
-        """autoRecall: false -> empty stdout."""
-        results = [{"text": "Something relevant", "type": "world"}]
-        response = FakeHTTPResponse({"results": results})
+        """autoRecall: false -> empty stdout, no API call."""
+        session_id = "ses-recall-disabled"
+        self._setup_healthy_session(tmp_path, session_id)
+
+        captured_calls = []
+
+        def capture_call(*args, **kwargs):
+            captured_calls.append(args)
+            return FakeHTTPResponse({"results": [{"text": "Something"}]})
 
         hook_input = {
-            "session_id": "ses-recall-7",
+            "session_id": session_id,
             "cwd": "/tmp/project",
             "prompt": "What is the answer to life?",
         }
 
         stdout, _ = _run_hook("recall", hook_input, tmp_path,
-                              urlopen_side_effect=lambda *a, **kw: response,
+                              urlopen_side_effect=capture_call,
                               extra_settings={"autoRecall": False})
 
         assert stdout == "", "Expected empty stdout when autoRecall is false"
+        assert len(captured_calls) == 0, "No API call when autoRecall is false"
+
+    def test_short_prompt_skips_recall(self, tmp_path):
+        """Prompt < 5 chars -> no API call, empty stdout."""
+        session_id = "ses-recall-short"
+        self._setup_healthy_session(tmp_path, session_id)
+
+        captured_calls = []
+
+        def capture_call(*args, **kwargs):
+            captured_calls.append(args)
+            return FakeHTTPResponse({"results": []})
+
+        hook_input = {
+            "session_id": session_id,
+            "cwd": "/tmp/project",
+            "prompt": "Hi",
+        }
+
+        stdout, _ = _run_hook("recall", hook_input, tmp_path,
+                              urlopen_side_effect=capture_call)
+
+        assert stdout == "", "Expected empty stdout for prompt shorter than 5 chars"
+        assert len(captured_calls) == 0, "No API call for short prompt"
 
 
 # ---
@@ -273,33 +510,30 @@ class TestRecallHook:
 
 
 class TestRetainHook:
-    def _make_transcript_jsonl(self, tmp_path, messages):
-        """Write a JSONL transcript in Claude Code nested format.
+    def _setup_healthy_session(self, tmp_path, session_id, turn_count=0):
+        """Pre-create a healthy session state so retain does not skip."""
+        _write_state(tmp_path, session_id, {
+            "healthy": True,
+            "turn_count": turn_count,
+            "error_notified": False,
+            "config_warned": False,
+            "bank_created": False,
+        })
 
-        Args:
-            tmp_path: Directory to write the transcript file into.
-            messages: List of ``{"role": str, "content": str}`` dicts.
+    def test_retain_calls_api_on_nth_turn(self, tmp_path):
+        """Healthy session, Nth turn -> retain API called."""
+        session_id = "ses-retain-nth"
+        # retainEveryNTurns=1 means every turn. Pre-set turn_count=0 so after
+        # increment it becomes 1, and 1 % 1 == 0 -> retain fires.
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
 
-        Returns:
-            Absolute path string of the created transcript file.
-        """
-        transcript_file = tmp_path / "transcript.jsonl"
-        lines = []
-        for msg in messages:
-            entry = {"type": msg["role"], "message": {"role": msg["role"], "content": msg["content"]}}
-            lines.append(json.dumps(entry))
-        transcript_file.write_text("\n".join(lines))
-        return str(transcript_file)
-
-    def test_posts_transcript_to_hindsight(self, tmp_path):
-        """Retain reads JSONL and calls API with content."""
-        transcript_path = self._make_transcript_jsonl(tmp_path, [
+        transcript_path = _make_transcript_jsonl(tmp_path, [
             {"role": "user", "content": "Tell me about Paris"},
             {"role": "assistant", "content": "Paris is the capital of France"},
         ])
 
         hook_input = {
-            "session_id": "ses-retain-1",
+            "session_id": session_id,
             "cwd": "/tmp/project",
             "transcript_path": transcript_path,
         }
@@ -315,41 +549,25 @@ class TestRetainHook:
         _run_hook("retain", hook_input, tmp_path,
                   urlopen_side_effect=capture_call)
 
-        assert len(captured_calls) == 1, "Expected exactly one API call"
+        assert len(captured_calls) == 1, "Expected exactly one retain API call"
         body = captured_calls[0]
         assert "items" in body
         assert len(body["items"]) == 1
-        # Content should include text from the transcript
         assert "Paris" in body["items"][0]["content"]
+        assert body.get("async") is True
 
-    def test_no_retain_on_empty_transcript(self, tmp_path):
-        """Nonexistent transcript -> no API call."""
-        hook_input = {
-            "session_id": "ses-retain-2",
-            "cwd": "/tmp/project",
-            "transcript_path": "/nonexistent/path/transcript.jsonl",
-        }
-
-        captured_calls = []
-
-        def capture_call(*args, **kwargs):
-            captured_calls.append(args)
-            return FakeHTTPResponse({"accepted": 0})
-
-        _run_hook("retain", hook_input, tmp_path,
-                  urlopen_side_effect=capture_call)
-
-        assert len(captured_calls) == 0, "Expected no API call for missing transcript"
-
-    def test_chunked_retain_skips_below_threshold(self, tmp_path):
+    def test_non_nth_turn_skips_retain(self, tmp_path):
         """With retainEveryNTurns=5, turn 1 -> no call."""
-        transcript_path = self._make_transcript_jsonl(tmp_path, [
+        session_id = "ses-retain-skip"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
+
+        transcript_path = _make_transcript_jsonl(tmp_path, [
             {"role": "user", "content": "Hello there"},
             {"role": "assistant", "content": "Hi, how can I help?"},
         ])
 
         hook_input = {
-            "session_id": "ses-retain-3",
+            "session_id": session_id,
             "cwd": "/tmp/project",
             "transcript_path": transcript_path,
         }
@@ -360,68 +578,255 @@ class TestRetainHook:
             captured_calls.append(args)
             return FakeHTTPResponse({"accepted": 1})
 
-        # retainEveryNTurns=5 means only turns 5, 10, 15… trigger a retain.
-        # This is the first call, so turn_count=1, and 1 % 5 != 0 → skip.
+        # retainEveryNTurns=5 means only turns 5, 10, 15... trigger a retain.
+        # After increment: turn_count=1, 1 % 5 != 0 -> skip.
         _run_hook("retain", hook_input, tmp_path,
                   urlopen_side_effect=capture_call,
                   extra_settings={"retainEveryNTurns": 5})
 
         assert len(captured_calls) == 0, "Expected no API call on turn 1 when retainEveryNTurns=5"
 
-    def test_retain_no_stdout_output(self, tmp_path):
-        """Stop hook produces no stdout."""
-        transcript_path = self._make_transcript_jsonl(tmp_path, [
-            {"role": "user", "content": "What is the meaning of life?"},
-            {"role": "assistant", "content": "The meaning of life is 42."},
+    def test_404_with_template_creates_bank_and_retries(self, tmp_path):
+        """404 on retain + template configured -> create_bank called, retain retried."""
+        session_id = "ses-retain-404-tmpl"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
+
+        transcript_path = _make_transcript_jsonl(tmp_path, [
+            {"role": "user", "content": "Tell me about machine learning"},
+            {"role": "assistant", "content": "Machine learning is a subset of AI"},
         ])
 
         hook_input = {
-            "session_id": "ses-retain-4",
+            "session_id": session_id,
             "cwd": "/tmp/project",
             "transcript_path": transcript_path,
         }
 
-        stdout, _ = _run_hook("retain", hook_input, tmp_path,
-                              urlopen_side_effect=lambda *a, **kw: FakeHTTPResponse({"accepted": 1}))
+        call_sequence = []
 
-        assert stdout == "", "Expected empty stdout for retain (fire-and-forget Stop hook)"
-
-    def test_retain_posts_async_true(self, tmp_path):
-        """Body contains 'async': true."""
-        transcript_path = self._make_transcript_jsonl(tmp_path, [
-            {"role": "user", "content": "Explain quantum entanglement"},
-            {"role": "assistant", "content": "Quantum entanglement is a phenomenon where particles are correlated."},
-        ])
-
-        hook_input = {
-            "session_id": "ses-retain-5",
-            "cwd": "/tmp/project",
-            "transcript_path": transcript_path,
-        }
-
-        captured_calls = []
-
-        def capture_call(*args, **kwargs):
+        def route_calls(*args, **kwargs):
             req = args[0]
+            url = req.full_url
             body = json.loads(req.data)
-            captured_calls.append(body)
+            call_sequence.append({"url": url, "body": body})
+
+            # First call: retain -> 404
+            if "/memories" in url and len([c for c in call_sequence if "/memories" in c["url"]]) == 1:
+                raise make_http_error(404, {"detail": "Bank not found"})
+            # Second call: create_bank -> 200
+            if "/ext/hindclaw/banks" in url:
+                return FakeHTTPResponse({"bank_id": "test-bank"})
+            # Third call: retry retain -> 200
             return FakeHTTPResponse({"accepted": 1})
 
         _run_hook("retain", hook_input, tmp_path,
-                  urlopen_side_effect=capture_call)
+                  urlopen_side_effect=route_calls,
+                  extra_settings={"template": "default-template"})
 
-        assert len(captured_calls) == 1
-        assert captured_calls[0].get("async") is True, "Expected 'async': true in retain request body"
+        urls = [c["url"] for c in call_sequence]
+        assert len(call_sequence) == 3, f"Expected 3 calls (retain, create_bank, retry retain), got {len(call_sequence)}: {urls}"
+
+        # First: retain attempt (404)
+        assert "/memories" in urls[0]
+        # Second: create_bank
+        assert "/ext/hindclaw/banks" in urls[1]
+        assert call_sequence[1]["body"]["template"] == "default-template"
+        assert call_sequence[1]["body"]["bank_id"] == "test-bank"
+        # Third: retry retain
+        assert "/memories" in urls[2]
+
+        state = _read_state(tmp_path, session_id)
+        assert state["bank_created"] is True
+
+    def test_404_without_template_marks_unhealthy(self, tmp_path):
+        """404 on retain + no template -> mark unhealthy, systemMessage output."""
+        session_id = "ses-retain-404-notmpl"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
+
+        transcript_path = _make_transcript_jsonl(tmp_path, [
+            {"role": "user", "content": "Tell me about AI safety"},
+            {"role": "assistant", "content": "AI safety is important"},
+        ])
+
+        hook_input = {
+            "session_id": session_id,
+            "cwd": "/tmp/project",
+            "transcript_path": transcript_path,
+        }
+
+        def raise_404(*args, **kwargs):
+            raise make_http_error(404, {"detail": "Bank not found"})
+
+        stdout, stderr = _run_hook("retain", hook_input, tmp_path,
+                                   urlopen_side_effect=raise_404,
+                                   extra_settings={"template": None})
+
+        state = _read_state(tmp_path, session_id)
+        assert state["healthy"] is False
+        assert "not found" in stderr.lower() or "template" in stderr.lower()
+        # systemMessage output for user notification
+        output = json.loads(stdout)
+        assert "systemMessage" in output
+        assert "template" in output["systemMessage"].lower()
+
+    def test_409_on_bank_creation_treated_as_success(self, tmp_path):
+        """409 on create_bank -> treat as already exists, retry retain."""
+        session_id = "ses-retain-409"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
+
+        transcript_path = _make_transcript_jsonl(tmp_path, [
+            {"role": "user", "content": "Explain quantum computing"},
+            {"role": "assistant", "content": "Quantum computing uses qubits"},
+        ])
+
+        hook_input = {
+            "session_id": session_id,
+            "cwd": "/tmp/project",
+            "transcript_path": transcript_path,
+        }
+
+        call_sequence = []
+
+        def route_calls(*args, **kwargs):
+            req = args[0]
+            url = req.full_url
+            body = json.loads(req.data)
+            call_sequence.append({"url": url, "body": body})
+
+            # First retain -> 404
+            if "/memories" in url and len([c for c in call_sequence if "/memories" in c["url"]]) == 1:
+                raise make_http_error(404, {"detail": "Bank not found"})
+            # create_bank -> 409
+            if "/ext/hindclaw/banks" in url:
+                raise make_http_error(409, {"detail": "Already exists"})
+            # Retry retain -> 200
+            return FakeHTTPResponse({"accepted": 1})
+
+        _run_hook("retain", hook_input, tmp_path,
+                  urlopen_side_effect=route_calls,
+                  extra_settings={"template": "default-template"})
+
+        urls = [c["url"] for c in call_sequence]
+        assert len(call_sequence) == 3, f"Expected 3 calls (retain, create_bank, retry), got {len(call_sequence)}: {urls}"
+
+        state = _read_state(tmp_path, session_id)
+        assert state["bank_created"] is True
+        assert state["healthy"] is True
+
+    def test_422_on_bank_creation_marks_unhealthy(self, tmp_path):
+        """422 on create_bank -> mark unhealthy."""
+        session_id = "ses-retain-422"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
+
+        transcript_path = _make_transcript_jsonl(tmp_path, [
+            {"role": "user", "content": "Tell me about Docker"},
+            {"role": "assistant", "content": "Docker is a containerization platform"},
+        ])
+
+        hook_input = {
+            "session_id": session_id,
+            "cwd": "/tmp/project",
+            "transcript_path": transcript_path,
+        }
+
+        call_sequence = []
+
+        def route_calls(*args, **kwargs):
+            req = args[0]
+            url = req.full_url
+            call_sequence.append(url)
+
+            # First retain -> 404
+            if "/memories" in url and call_sequence.count(url) == 1:
+                raise make_http_error(404, {"detail": "Bank not found"})
+            # create_bank -> 422
+            if "/ext/hindclaw/banks" in url:
+                raise make_http_error(422, {"detail": "Invalid bank config"})
+            return FakeHTTPResponse({"accepted": 1})
+
+        stdout, stderr = _run_hook("retain", hook_input, tmp_path,
+                                    urlopen_side_effect=route_calls,
+                                    extra_settings={"template": "default-template"})
+
+        state = _read_state(tmp_path, session_id)
+        assert state["healthy"] is False
+        assert "422" in stderr or "validation" in stderr.lower()
+        # systemMessage output for user notification
+        output = json.loads(stdout)
+        assert "systemMessage" in output
+
+    def test_401_on_retain_marks_unhealthy(self, tmp_path):
+        """401 on retain -> mark unhealthy."""
+        session_id = "ses-retain-401"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
+
+        transcript_path = _make_transcript_jsonl(tmp_path, [
+            {"role": "user", "content": "Explain neural networks"},
+            {"role": "assistant", "content": "Neural networks are computing systems"},
+        ])
+
+        hook_input = {
+            "session_id": session_id,
+            "cwd": "/tmp/project",
+            "transcript_path": transcript_path,
+        }
+
+        def raise_401(*args, **kwargs):
+            raise make_http_error(401, {"detail": "Unauthorized"})
+
+        stdout, stderr = _run_hook("retain", hook_input, tmp_path,
+                                    urlopen_side_effect=raise_401)
+
+        state = _read_state(tmp_path, session_id)
+        assert state["healthy"] is False
+        assert "401" in stderr or "denied" in stderr.lower()
+        # systemMessage output for user notification
+        output = json.loads(stdout)
+        assert "systemMessage" in output
+        assert "denied" in output["systemMessage"].lower()
+
+    def test_403_on_retain_marks_unhealthy(self, tmp_path):
+        """403 on retain -> mark unhealthy."""
+        session_id = "ses-retain-403"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
+
+        transcript_path = _make_transcript_jsonl(tmp_path, [
+            {"role": "user", "content": "What is Kubernetes?"},
+            {"role": "assistant", "content": "Kubernetes is a container orchestrator"},
+        ])
+
+        hook_input = {
+            "session_id": session_id,
+            "cwd": "/tmp/project",
+            "transcript_path": transcript_path,
+        }
+
+        def raise_403(*args, **kwargs):
+            raise make_http_error(403, {"detail": "Forbidden"})
+
+        stdout, stderr = _run_hook("retain", hook_input, tmp_path,
+                                    urlopen_side_effect=raise_403)
+
+        state = _read_state(tmp_path, session_id)
+        assert state["healthy"] is False
+        assert "403" in stderr or "denied" in stderr.lower()
+        # systemMessage output for user notification
+        output = json.loads(stdout)
+        assert "systemMessage" in output
+        assert "denied" in output["systemMessage"].lower()
 
     def test_disabled_auto_retain_does_not_call_api(self, tmp_path):
         """autoRetain: false -> no API call."""
-        transcript_path = self._make_transcript_jsonl(tmp_path, [
+        session_id = "ses-retain-disabled"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
+
+        transcript_path = _make_transcript_jsonl(tmp_path, [
             {"role": "user", "content": "How do I bake bread?"},
             {"role": "assistant", "content": "You need flour, yeast, water and salt."},
         ])
 
         hook_input = {
-            "session_id": "ses-retain-6",
+            "session_id": session_id,
             "cwd": "/tmp/project",
             "transcript_path": transcript_path,
         }
@@ -438,57 +843,26 @@ class TestRetainHook:
 
         assert len(captured_calls) == 0, "Expected no API call when autoRetain is false"
 
+    def test_retain_no_stdout_output(self, tmp_path):
+        """Stop hook produces no stdout (fire-and-forget)."""
+        session_id = "ses-retain-silent"
+        self._setup_healthy_session(tmp_path, session_id, turn_count=0)
 
-# ---
-# TestSessionStartHook
-# ---
+        transcript_path = _make_transcript_jsonl(tmp_path, [
+            {"role": "user", "content": "What is the meaning of life?"},
+            {"role": "assistant", "content": "The meaning of life is 42."},
+        ])
 
-
-class TestSessionStartHook:
-    def test_writes_healthy_state_on_success(self, tmp_path):
-        """Health check success -> state file with healthy: true."""
         hook_input = {
-            "session_id": "ses-start-1",
+            "session_id": session_id,
             "cwd": "/tmp/project",
+            "transcript_path": transcript_path,
         }
 
-        plugin_data = tmp_path / "plugin_data"
-        plugin_data.mkdir(exist_ok=True)
-        state_dir = plugin_data / "state"
+        stdout, _ = _run_hook("retain", hook_input, tmp_path,
+                              urlopen_side_effect=lambda *a, **kw: FakeHTTPResponse({"accepted": 1}))
 
-        # Health check hits /health — return 200
-        def urlopen_stub(*args, **kwargs):
-            return FakeHTTPResponse({"status": "ok"})
-
-        _run_hook("session_start", hook_input, tmp_path,
-                  urlopen_side_effect=urlopen_stub)
-
-        state_file = state_dir / "ses-start-1.json"
-        assert state_file.exists(), "Expected state file to be written on SessionStart"
-        state = json.loads(state_file.read_text())
-        assert state.get("healthy") is True, "Expected healthy: true after successful health check"
-
-    def test_writes_unhealthy_state_on_failure(self, tmp_path):
-        """Health check failure -> state file with healthy: false."""
-        hook_input = {
-            "session_id": "ses-start-2",
-            "cwd": "/tmp/project",
-        }
-
-        plugin_data = tmp_path / "plugin_data"
-        plugin_data.mkdir(exist_ok=True)
-        state_dir = plugin_data / "state"
-
-        def urlopen_stub(*args, **kwargs):
-            raise OSError("Connection refused")
-
-        _run_hook("session_start", hook_input, tmp_path,
-                  urlopen_side_effect=urlopen_stub)
-
-        state_file = state_dir / "ses-start-2.json"
-        assert state_file.exists(), "Expected state file to be written even on health check failure"
-        state = json.loads(state_file.read_text())
-        assert state.get("healthy") is False, "Expected healthy: false after failed health check"
+        assert stdout == "", "Expected empty stdout for retain (fire-and-forget Stop hook)"
 
 
 # ---
@@ -499,17 +873,20 @@ class TestSessionStartHook:
 class TestSessionEndHook:
     def test_deletes_state_file(self, tmp_path):
         """Cleanup removes the session state file."""
-        plugin_data = tmp_path / "plugin_data"
-        state_dir = plugin_data / "state"
-        state_dir.mkdir(parents=True, exist_ok=True)
+        session_id = "ses-end-1"
+        _write_state(tmp_path, session_id, {
+            "healthy": True,
+            "turn_count": 3,
+            "error_notified": False,
+            "config_warned": False,
+            "bank_created": False,
+        })
 
-        # Pre-create the state file that SessionEnd should delete.
-        state_file = state_dir / "ses-end-1.json"
-        state_file.write_text(json.dumps({"healthy": True, "denied_banks": [], "turn_count": 3}))
+        state_file = tmp_path / "plugin_data" / "state" / f"{session_id}.json"
         assert state_file.exists(), "Pre-condition: state file must exist before SessionEnd"
 
         hook_input = {
-            "session_id": "ses-end-1",
+            "session_id": session_id,
             "cwd": "/tmp/project",
         }
 

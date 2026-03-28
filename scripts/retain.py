@@ -170,6 +170,11 @@ def main() -> None:
     retain_context = config.get("retainContext", "")
     items = [{"content": transcript_text, "context": retain_context}]
 
+    def _notify_error(msg: str) -> None:
+        """Output systemMessage to stdout and log to stderr."""
+        print(f"[HindClaw] {msg}", file=sys.stderr)
+        json.dump({"systemMessage": f"HindClaw: {msg}"}, sys.stdout)
+
     try:
         client.retain(bank_id, items, async_=True)
         debug_log(config, f"retain: submitted {part_count} parts to bank {bank_id!r}")
@@ -179,10 +184,8 @@ def main() -> None:
             template = config.get("template")
             state = read_session_state(session_id)
             if not template:
-                print(
-                    f"[HindClaw] retain: bank {bank_id!r} not found. "
-                    f"Set 'template' in config to auto-create.",
-                    file=sys.stderr,
+                _notify_error(
+                    f"Bank '{bank_id}' not found. Set 'template' in .claude/hindclaw.json to auto-create."
                 )
                 mark_unhealthy(session_id)
                 return
@@ -213,23 +216,23 @@ def main() -> None:
                     except Exception as retry_exc:
                         print(f"[HindClaw] retain: retry after 409 failed: {retry_exc}", file=sys.stderr)
                 elif create_exc.status_code == 403:
-                    print(f"[HindClaw] retain: no permission to create bank (403)", file=sys.stderr)
+                    _notify_error("No permission to create bank. Check your service account's iam:banks:write policy.")
                     mark_unhealthy(session_id)
                 elif create_exc.status_code == 404:
-                    print(f"[HindClaw] retain: template {template!r} not found on server", file=sys.stderr)
+                    _notify_error(f"Template '{template}' not found on server.")
                     mark_unhealthy(session_id)
                 elif create_exc.status_code == 422:
-                    print(f"[HindClaw] retain: bank creation validation error: {create_exc.body}", file=sys.stderr)
+                    _notify_error(f"Bank creation validation error: {create_exc.body}")
                     mark_unhealthy(session_id)
                 else:
-                    print(f"[HindClaw] retain: bank creation failed ({create_exc.status_code}): {create_exc.body}", file=sys.stderr)
+                    _notify_error(f"Bank creation failed ({create_exc.status_code}): {create_exc.body}")
                     mark_unhealthy(session_id)
             except Exception as create_exc:
                 print(f"[HindClaw] retain: bank creation error: {create_exc}", file=sys.stderr)
                 mark_unhealthy(session_id)
             return
         if exc.status_code in (401, 403):
-            print(f"[HindClaw] retain: access denied ({exc.status_code}), marking unhealthy", file=sys.stderr)
+            _notify_error(f"Memory access denied ({exc.status_code}). Check your API key and bank permissions.")
             mark_unhealthy(session_id)
             return
         print(f"[HindClaw] retain: HTTP error {exc.status_code}: {exc.body}", file=sys.stderr)

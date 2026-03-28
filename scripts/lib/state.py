@@ -177,14 +177,22 @@ def increment_turn(session_id: str) -> int:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
+_VALID_FLAGS = {"healthy", "error_notified", "config_warned", "bank_created"}
+
+
 def set_flag(session_id: str, flag: str, value: bool) -> None:
     """Atomically set a boolean flag in session state.
 
     Args:
         session_id: Session identifier.
-        flag: Flag name (error_notified, config_warned, bank_created).
+        flag: Flag name (healthy, error_notified, config_warned, bank_created).
         value: Boolean value to set.
+
+    Raises:
+        ValueError: If flag is not a recognized state flag.
     """
+    if flag not in _VALID_FLAGS:
+        raise ValueError(f"Unknown state flag: {flag!r}")
     path = _state_file(session_id)
     lock_path = path + ".lock"
     with _thread_lock:
