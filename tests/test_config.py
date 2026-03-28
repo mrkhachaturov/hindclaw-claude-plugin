@@ -1,20 +1,23 @@
 import json
 import os
-import sys
+import tempfile
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+
+from scripts.lib.config import load_config, debug_log
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_json(tmp_path, rel, data):
-    """Write a JSON file at tmp_path / rel, creating parent dirs."""
-    p = tmp_path / rel
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data))
-    return str(p)
+def _write_json(directory: str, rel: str, data: dict) -> str:
+    """Write a JSON file at directory/rel, creating parent dirs."""
+    path = os.path.join(directory, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -24,732 +27,493 @@ def _write_json(tmp_path, rel, data):
 class TestLayerMergePriority:
     """Layer 1 (env) > Layer 2 (project) > Layer 3 (user) > Layer 4 (defaults)."""
 
-    def test_defaults_are_base(self, tmp_path):
-        from scripts.lib.config import load_config
+    def test_defaults_are_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://default.example.com",
+                "autoRecall": True,
+                "debug": False,
+            })
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        settings = {
-            "hindsightApiUrl": "http://default.example.com",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "",
-            "agentName": "",
-            "bankId": "",
-            "autoRecall": True,
-            "debug": False,
-        }
-        _write_json(tmp_path, "plugin/settings.json", settings)
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                with patch.dict(os.environ, {"HINDCLAW_API_URL": "", "HINDCLAW_API_KEY": ""}, clear=False):
+                    os.environ.pop("HINDCLAW_API_URL", None)
+                    os.environ.pop("HINDCLAW_API_KEY", None)
+                    with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                        config = load_config({"cwd": project_dir})
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+            assert config["hindsightApiUrl"] == "http://default.example.com"
+            assert config["autoRecall"] is True
 
-        assert config["hindsightApiUrl"] == "http://default.example.com"
-        assert config["clientId"] == "claude-code"
+    def test_user_config_overrides_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://default.example.com",
+                "debug": False,
+            })
 
-    def test_user_config_overrides_defaults(self, tmp_path):
-        from scripts.lib.config import load_config
+            home_dir = os.path.join(tmp, "home")
+            _write_json(tmp, "home/.claude/hindclaw.json", {
+                "hindsightApiUrl": "http://user.example.com",
+            })
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "http://default.example.com",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "",
-            "agentName": "",
-            "bankId": "",
-            "debug": False,
-        })
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
 
-        home_dir = str(tmp_path / "home")
-        os.makedirs(home_dir + "/.claude", exist_ok=True)
-        _write_json(tmp_path, "home/.claude/hindclaw.json", {
-            "hindsightApiUrl": "http://user.example.com",
-        })
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
+            assert config["hindsightApiUrl"] == "http://user.example.com"
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
-                with patch("subprocess.run") as mock_run:
-                    mock_run.return_value = MagicMock(returncode=1, stdout="")
-                    config = load_config(hook_input)
+    def test_project_config_overrides_user_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://default.example.com",
+            })
 
-        assert config["hindsightApiUrl"] == "http://user.example.com"
+            home_dir = os.path.join(tmp, "home")
+            _write_json(tmp, "home/.claude/hindclaw.json", {
+                "hindsightApiUrl": "http://user.example.com",
+            })
 
-    def test_project_config_overrides_user_config(self, tmp_path):
-        from scripts.lib.config import load_config
+            project_dir = os.path.join(tmp, "project")
+            _write_json(tmp, "project/.claude/hindclaw.json", {
+                "hindsightApiUrl": "http://project.example.com",
+            })
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "http://default.example.com",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "",
-            "agentName": "",
-            "bankId": "",
-            "debug": False,
-        })
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        home_dir = str(tmp_path / "home")
-        os.makedirs(home_dir + "/.claude", exist_ok=True)
-        _write_json(tmp_path, "home/.claude/hindclaw.json", {
-            "hindsightApiUrl": "http://user.example.com",
-        })
+            assert config["hindsightApiUrl"] == "http://project.example.com"
 
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir + "/.claude", exist_ok=True)
-        _write_json(tmp_path, "project/.claude/hindclaw.json", {
-            "hindsightApiUrl": "http://project.example.com",
-        })
+    def test_env_api_url_overrides_project_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://default.example.com",
+            })
 
-        hook_input = {"cwd": project_dir}
+            project_dir = os.path.join(tmp, "project")
+            _write_json(tmp, "project/.claude/hindclaw.json", {
+                "hindsightApiUrl": "http://project.example.com",
+            })
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
-                with patch("subprocess.run") as mock_run:
-                    mock_run.return_value = MagicMock(returncode=1, stdout="")
-                    config = load_config(hook_input)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        assert config["hindsightApiUrl"] == "http://project.example.com"
+            env = {
+                "CLAUDE_PLUGIN_ROOT": plugin_root,
+                "HINDCLAW_API_URL": "http://env.example.com",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-    def test_env_var_overrides_project_config(self, tmp_path):
-        from scripts.lib.config import load_config
+            assert config["hindsightApiUrl"] == "http://env.example.com"
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "http://default.example.com",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "",
-            "agentName": "",
-            "bankId": "",
-            "debug": False,
-        })
+    def test_env_api_key_overrides_project_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "apiKey": "default-key",
+            })
 
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir + "/.claude", exist_ok=True)
-        _write_json(tmp_path, "project/.claude/hindclaw.json", {
-            "hindsightApiUrl": "http://project.example.com",
-        })
+            project_dir = os.path.join(tmp, "project")
+            _write_json(tmp, "project/.claude/hindclaw.json", {
+                "apiKey": "project-key",
+            })
 
-        hook_input = {"cwd": project_dir}
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        env = {
-            "CLAUDE_PLUGIN_ROOT": plugin_root,
-            "HINDCLAW_API_URL": "http://env.example.com",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+            env = {
+                "CLAUDE_PLUGIN_ROOT": plugin_root,
+                "HINDCLAW_API_KEY": "env-key",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        assert config["hindsightApiUrl"] == "http://env.example.com"
+            assert config["apiKey"] == "env-key"
 
-    def test_env_user_id_overrides_config(self, tmp_path):
-        from scripts.lib.config import load_config
+    def test_all_four_layers_stack_correctly(self):
+        """Verify all 4 layers contribute distinct keys that don't override each other."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "fromDefaults": "defaults",
+                "shared": "from-defaults",
+            })
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "",
-            "userId": "from-settings@example.com",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "prefix",
-            "agentName": "agent",
-            "bankId": "",
-            "debug": False,
-        })
+            home_dir = os.path.join(tmp, "home")
+            _write_json(tmp, "home/.claude/hindclaw.json", {
+                "fromUser": "user",
+                "shared": "from-user",
+            })
 
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
+            project_dir = os.path.join(tmp, "project")
+            _write_json(tmp, "project/.claude/hindclaw.json", {
+                "fromProject": "project",
+                "shared": "from-project",
+            })
 
-        env = {
-            "CLAUDE_PLUGIN_ROOT": plugin_root,
-            "HINDCLAW_USER_ID": "from-env@example.com",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+            env = {
+                "CLAUDE_PLUGIN_ROOT": plugin_root,
+                "HINDCLAW_API_URL": "http://env.example.com",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        assert config["userId"] == "from-env@example.com"
-
-    def test_env_jwt_secret_overrides_config(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "",
-            "userId": "user@example.com",
-            "jwtSecret": "settings-secret",
-            "clientId": "claude-code",
-            "bankIdPrefix": "prefix",
-            "agentName": "agent",
-            "bankId": "",
-            "debug": False,
-        })
-
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
-
-        env = {
-            "CLAUDE_PLUGIN_ROOT": plugin_root,
-            "HINDCLAW_JWT_SECRET": "env-secret",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
-
-        assert config["jwtSecret"] == "env-secret"
-
-    def test_missing_user_config_is_skipped_gracefully(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "http://default.example.com",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "",
-            "agentName": "",
-            "bankId": "",
-            "debug": False,
-        })
-
-        home_dir = str(tmp_path / "home-no-config")
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
-
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
-                with patch("subprocess.run") as mock_run:
-                    mock_run.return_value = MagicMock(returncode=1, stdout="")
-                    config = load_config(hook_input)
-
-        assert config["hindsightApiUrl"] == "http://default.example.com"
-
-    def test_missing_project_config_is_skipped_gracefully(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "http://default.example.com",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "",
-            "agentName": "",
-            "bankId": "",
-            "debug": False,
-        })
-
-        project_dir = str(tmp_path / "project-no-claude-dir")
-        os.makedirs(project_dir, exist_ok=True)
-
-        hook_input = {"cwd": project_dir}
-
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
-
-        assert config["hindsightApiUrl"] == "http://default.example.com"
+            # Each layer contributes its unique key
+            assert config["fromDefaults"] == "defaults"
+            assert config["fromUser"] == "user"
+            assert config["fromProject"] == "project"
+            assert config["hindsightApiUrl"] == "http://env.example.com"
+            # Highest priority wins for the shared key
+            assert config["shared"] == "from-project"
 
 
 # ---------------------------------------------------------------------------
-# User ID resolution tests
+# No auto-derivation tests
 # ---------------------------------------------------------------------------
 
-class TestResolveUserId:
-    def _make_config(self, tmp_path, plugin_root_data=None, project_data=None, env=None):
-        """Helper to call load_config with controlled layers."""
-        from scripts.lib.config import load_config
+class TestNoAutoDerivation:
+    """Verify no userId, agentName, bankIdPrefix, or bankId are auto-derived."""
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        defaults = {
-            "hindsightApiUrl": "",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "prefix",
-            "agentName": "agent",
-            "bankId": "",
-            "debug": False,
-        }
-        if plugin_root_data:
-            defaults.update(plugin_root_data)
-        _write_json(tmp_path, "plugin/settings.json", defaults)
+    def test_no_userId_in_result_when_not_in_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {"hindsightApiUrl": "http://x.com"})
 
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir + "/.claude", exist_ok=True)
-        if project_data:
-            _write_json(tmp_path, "project/.claude/hindclaw.json", project_data)
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        hook_input = {"cwd": project_dir}
-        base_env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
-        if env:
-            base_env.update(env)
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        # Remove any HINDCLAW_* vars that could bleed from the real environment
-        remove_keys = ["HINDCLAW_API_URL", "HINDCLAW_USER_ID", "HINDCLAW_JWT_SECRET"]
-        with patch.dict(os.environ, base_env, clear=False):
-            for k in remove_keys:
-                os.environ.pop(k, None)
-            yield load_config, hook_input
+            # userId must NOT be auto-injected
+            assert "userId" not in config
 
-    def test_user_id_from_env_var(self, tmp_path):
-        from scripts.lib.config import load_config
+    def test_no_agentName_in_result_when_not_in_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {"hindsightApiUrl": "http://x.com"})
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "prefix",
-            "agentName": "agent",
-            "bankId": "",
-            "debug": False,
-        })
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        env = {"CLAUDE_PLUGIN_ROOT": plugin_root, "HINDCLAW_USER_ID": "env-user@example.com"}
-        with patch.dict(os.environ, env, clear=False):
-            os.environ.pop("HINDCLAW_API_URL", None)
-            os.environ.pop("HINDCLAW_JWT_SECRET", None)
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+            assert "agentName" not in config
 
-        assert config["userId"] == "env-user@example.com"
+    def test_no_bankId_derived_when_not_in_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://x.com",
+                "bankIdPrefix": "someprefix",
+            })
 
-    def test_user_id_from_config(self, tmp_path):
-        from scripts.lib.config import load_config
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "",
-            "userId": "settings-user@example.com",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "prefix",
-            "agentName": "agent",
-            "bankId": "",
-            "debug": False,
-        })
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
+            # bankId must NOT be auto-derived from prefix + agent
+            assert "bankId" not in config
 
-        env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
-        with patch.dict(os.environ, env, clear=False):
-            os.environ.pop("HINDCLAW_USER_ID", None)
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+    def test_bankId_passthrough_when_explicit_in_config(self):
+        """Explicit bankId in config passes through unchanged — no derivation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "bankId": "explicit::bank",
+            })
 
-        assert config["userId"] == "settings-user@example.com"
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-    def test_user_id_falls_back_to_git_config(self, tmp_path):
-        from scripts.lib.config import load_config
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "prefix",
-            "agentName": "agent",
-            "bankId": "",
-            "debug": False,
-        })
+            assert config["bankId"] == "explicit::bank"
 
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
+    def test_no_subprocess_called(self):
+        """load_config must not call any subprocess (no git commands)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {"hindsightApiUrl": "http://x.com"})
 
-        env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        def mock_subprocess_run(cmd, **kwargs):
-            result = MagicMock()
-            if cmd == ["git", "config", "user.email"]:
-                result.returncode = 0
-                result.stdout = "git-user@example.com\n"
-            else:
-                result.returncode = 1
-                result.stdout = ""
-            return result
-
-        with patch.dict(os.environ, env, clear=False):
-            os.environ.pop("HINDCLAW_USER_ID", None)
-            with patch("subprocess.run", side_effect=mock_subprocess_run):
-                config = load_config(hook_input)
-
-        assert config["userId"] == "git-user@example.com"
-
-    def test_user_id_empty_when_git_config_fails(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        _write_json(tmp_path, "plugin/settings.json", {
-            "hindsightApiUrl": "",
-            "userId": "",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "prefix",
-            "agentName": "agent",
-            "bankId": "",
-            "debug": False,
-        })
-
-        hook_input = {"cwd": str(tmp_path / "project")}
-        os.makedirs(str(tmp_path / "project"), exist_ok=True)
-
-        env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
-        with patch.dict(os.environ, env, clear=False):
-            os.environ.pop("HINDCLAW_USER_ID", None)
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
-
-        assert config["userId"] == ""
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    with patch("subprocess.run") as mock_run:
+                        load_config({"cwd": project_dir})
+                        mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Agent name resolution tests
+# Env variable override tests
 # ---------------------------------------------------------------------------
 
-class TestResolveAgentName:
-    def _base_settings(self, tmp_path, extra=None):
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        data = {
-            "hindsightApiUrl": "",
-            "userId": "user@example.com",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "user_example_com",
-            "agentName": "",
-            "bankId": "",
-            "debug": False,
-        }
-        if extra:
-            data.update(extra)
-        _write_json(tmp_path, "plugin/settings.json", data)
-        return plugin_root
+class TestEnvVarOverrides:
+    """Env vars HINDCLAW_API_URL and HINDCLAW_API_KEY override everything."""
 
-    def test_explicit_agent_name_wins(self, tmp_path):
-        from scripts.lib.config import load_config
+    def test_api_url_env_sets_hindsightApiUrl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        plugin_root = self._base_settings(tmp_path, {"agentName": "explicit-agent"})
-        project_dir = str(tmp_path / "my-project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
+            env = {"HINDCLAW_API_URL": "http://from-env.example.com"}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+            assert config["hindsightApiUrl"] == "http://from-env.example.com"
 
-        assert config["agentName"] == "explicit-agent"
+    def test_api_key_env_sets_apiKey(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-    def test_agent_name_from_git_remote_https(self, tmp_path):
-        from scripts.lib.config import load_config
+            env = {"HINDCLAW_API_KEY": "secret-from-env"}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        plugin_root = self._base_settings(tmp_path)
-        project_dir = str(tmp_path / "my-project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
+            assert config["apiKey"] == "secret-from-env"
 
-        def mock_subprocess_run(cmd, **kwargs):
-            result = MagicMock()
-            if cmd == ["git", "-C", project_dir, "remote", "get-url", "origin"]:
-                result.returncode = 0
-                result.stdout = "https://github.com/user/astromech.git\n"
-            else:
-                result.returncode = 1
-                result.stdout = ""
-            return result
+    def test_empty_env_vars_do_not_override(self):
+        """Empty string env vars must not overwrite config values."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://from-settings.example.com",
+                "apiKey": "settings-key",
+            })
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run", side_effect=mock_subprocess_run):
-                config = load_config(hook_input)
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        assert config["agentName"] == "astromech"
+            # Env vars present but empty — should not override
+            env = {
+                "CLAUDE_PLUGIN_ROOT": plugin_root,
+                "HINDCLAW_API_URL": "",
+                "HINDCLAW_API_KEY": "",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-    def test_agent_name_from_git_remote_ssh(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = self._base_settings(tmp_path)
-        project_dir = str(tmp_path / "my-project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
-
-        def mock_subprocess_run(cmd, **kwargs):
-            result = MagicMock()
-            if cmd == ["git", "-C", project_dir, "remote", "get-url", "origin"]:
-                result.returncode = 0
-                result.stdout = "git@github.com:user/my-repo.git\n"
-            else:
-                result.returncode = 1
-                result.stdout = ""
-            return result
-
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run", side_effect=mock_subprocess_run):
-                config = load_config(hook_input)
-
-        assert config["agentName"] == "my-repo"
-
-    def test_agent_name_strips_dot_git_suffix(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = self._base_settings(tmp_path)
-        project_dir = str(tmp_path / "my-project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
-
-        def mock_subprocess_run(cmd, **kwargs):
-            result = MagicMock()
-            if cmd == ["git", "-C", project_dir, "remote", "get-url", "origin"]:
-                result.returncode = 0
-                result.stdout = "https://github.com/org/repo-name.git\n"
-            else:
-                result.returncode = 1
-                result.stdout = ""
-            return result
-
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run", side_effect=mock_subprocess_run):
-                config = load_config(hook_input)
-
-        assert config["agentName"] == "repo-name"
-
-    def test_agent_name_fallback_to_folder_basename(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = self._base_settings(tmp_path)
-        project_dir = str(tmp_path / "my-special-project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
-
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
-
-        assert config["agentName"] == "my-special-project"
-
-    def test_agent_name_from_project_config_explicit(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = self._base_settings(tmp_path)
-        project_dir = str(tmp_path / "my-project")
-        os.makedirs(project_dir + "/.claude")
-        _write_json(tmp_path, "my-project/.claude/hindclaw.json", {"agentName": "project-agent"})
-        hook_input = {"cwd": project_dir}
-
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
-
-        assert config["agentName"] == "project-agent"
+            assert config["hindsightApiUrl"] == "http://from-settings.example.com"
+            assert config["apiKey"] == "settings-key"
 
 
 # ---------------------------------------------------------------------------
-# Bank ID derivation tests
+# Missing config files handled gracefully
 # ---------------------------------------------------------------------------
 
-class TestDeriveBankId:
-    def _base_settings(self, tmp_path, extra=None):
-        plugin_root = str(tmp_path / "plugin")
-        os.makedirs(plugin_root)
-        data = {
-            "hindsightApiUrl": "",
-            "userId": "user@example.com",
-            "jwtSecret": "",
-            "clientId": "claude-code",
-            "bankIdPrefix": "",
-            "agentName": "",
-            "bankId": "",
-            "debug": False,
-        }
-        if extra:
-            data.update(extra)
-        _write_json(tmp_path, "plugin/settings.json", data)
-        return plugin_root
+class TestMissingFiles:
+    def test_missing_plugin_settings_returns_partial_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-    def test_explicit_bank_id_skips_derivation(self, tmp_path):
-        from scripts.lib.config import load_config
+            # CLAUDE_PLUGIN_ROOT points to non-existent dir
+            env = {"CLAUDE_PLUGIN_ROOT": os.path.join(tmp, "no-such-plugin")}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        plugin_root = self._base_settings(tmp_path, {
-            "bankId": "custom::bank",
-            "agentName": "ignored",
-            "bankIdPrefix": "ignored",
-        })
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
+            # Should succeed with empty config, not raise
+            assert isinstance(config, dict)
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+    def test_missing_user_config_skipped_gracefully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://default.example.com",
+            })
 
-        assert config["bankId"] == "custom::bank"
+            project_dir = os.path.join(tmp, "project")
+            os.makedirs(project_dir)
+            # home_dir has no .claude/hindclaw.json
+            home_dir = os.path.join(tmp, "home-empty")
+            os.makedirs(home_dir)
 
-    def test_bank_id_derived_from_prefix_and_agent(self, tmp_path):
-        from scripts.lib.config import load_config
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        plugin_root = self._base_settings(tmp_path, {
-            "bankIdPrefix": "myprefix",
-            "agentName": "myagent",
-        })
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
+            assert config["hindsightApiUrl"] == "http://default.example.com"
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+    def test_missing_project_config_skipped_gracefully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://default.example.com",
+            })
 
-        assert config["bankId"] == "myprefix::myagent"
+            # project dir has no .claude/hindclaw.json
+            project_dir = os.path.join(tmp, "project-no-config")
+            os.makedirs(project_dir)
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-    def test_bank_id_auto_prefix_from_email(self, tmp_path):
-        from scripts.lib.config import load_config
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        plugin_root = self._base_settings(tmp_path, {
-            "userId": "ceo@astrateam.net",
-            "agentName": "astromech",
-        })
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
+            assert config["hindsightApiUrl"] == "http://default.example.com"
 
-        def mock_subprocess_run(cmd, **kwargs):
-            result = MagicMock()
-            result.returncode = 1
-            result.stdout = ""
-            return result
+    def test_invalid_json_in_project_config_skipped_gracefully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://default.example.com",
+            })
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            os.environ.pop("HINDCLAW_USER_ID", None)
-            with patch("subprocess.run", side_effect=mock_subprocess_run):
-                config = load_config(hook_input)
+            project_dir = os.path.join(tmp, "project")
+            claude_dir = os.path.join(project_dir, ".claude")
+            os.makedirs(claude_dir)
+            with open(os.path.join(claude_dir, "hindclaw.json"), "w") as f:
+                f.write("not valid json {{{")
 
-        assert config["bankId"] == "ceo_astrateam_net::astromech"
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-    def test_bank_id_auto_prefix_replaces_at_and_dot(self, tmp_path):
-        from scripts.lib.config import load_config
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": project_dir})
 
-        plugin_root = self._base_settings(tmp_path, {
-            "userId": "john.doe@my.company.io",
-            "agentName": "myproject",
-        })
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
+            # Falls back to plugin defaults, does not raise
+            assert config["hindsightApiUrl"] == "http://default.example.com"
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            os.environ.pop("HINDCLAW_USER_ID", None)
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
+    def test_empty_cwd_skips_project_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_root = os.path.join(tmp, "plugin")
+            os.makedirs(plugin_root)
+            _write_json(tmp, "plugin/settings.json", {
+                "hindsightApiUrl": "http://default.example.com",
+            })
 
-        assert config["bankId"] == "john_doe_my_company_io::myproject"
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-    def test_bank_id_uses_git_remote_for_agent_name(self, tmp_path):
-        from scripts.lib.config import load_config
+            env = {"CLAUDE_PLUGIN_ROOT": plugin_root}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({"cwd": ""})
 
-        plugin_root = self._base_settings(tmp_path, {
-            "userId": "ceo@astrateam.net",
-        })
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
+            assert config["hindsightApiUrl"] == "http://default.example.com"
 
-        def mock_subprocess_run(cmd, **kwargs):
-            result = MagicMock()
-            if cmd == ["git", "-C", project_dir, "remote", "get-url", "origin"]:
-                result.returncode = 0
-                result.stdout = "https://github.com/user/astromech.git\n"
-            else:
-                result.returncode = 1
-                result.stdout = ""
-            return result
+    def test_missing_cwd_key_handled_gracefully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home_dir = os.path.join(tmp, "home")
+            os.makedirs(home_dir)
 
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            os.environ.pop("HINDCLAW_USER_ID", None)
-            with patch("subprocess.run", side_effect=mock_subprocess_run):
-                config = load_config(hook_input)
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("HINDCLAW_API_URL", None)
+                os.environ.pop("HINDCLAW_API_KEY", None)
+                os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+                with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home_dir)):
+                    config = load_config({})
 
-        assert config["bankId"] == "ceo_astrateam_net::astromech"
-
-    def test_bank_id_uses_folder_fallback_for_agent_name(self, tmp_path):
-        from scripts.lib.config import load_config
-
-        plugin_root = self._base_settings(tmp_path, {
-            "userId": "user@example.com",
-            "bankIdPrefix": "myprefix",
-        })
-        project_dir = str(tmp_path / "my-special-folder")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
-
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            os.environ.pop("HINDCLAW_USER_ID", None)
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
-
-        assert config["bankId"] == "myprefix::my-special-folder"
-
-    def test_bank_id_empty_when_no_agent_and_no_user(self, tmp_path):
-        """If userId is empty and no prefix, bankId should be empty or gracefully handled."""
-        from scripts.lib.config import load_config
-
-        plugin_root = self._base_settings(tmp_path, {"userId": ""})
-        project_dir = str(tmp_path / "project")
-        os.makedirs(project_dir)
-        hook_input = {"cwd": project_dir}
-
-        with patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": plugin_root}, clear=False):
-            os.environ.pop("HINDCLAW_USER_ID", None)
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                config = load_config(hook_input)
-
-        # userId is empty, so auto-prefix from email is empty → bankId should be empty
-        assert config["bankId"] == ""
+            assert isinstance(config, dict)
 
 
 # ---------------------------------------------------------------------------
@@ -758,18 +522,15 @@ class TestDeriveBankId:
 
 class TestDebugLog:
     def test_debug_log_writes_to_stderr_when_debug_true(self, capsys):
-        from scripts.lib.config import debug_log
-
         config = {"debug": True}
         debug_log(config, "test message", "extra")
 
         captured = capsys.readouterr()
         assert "test message" in captured.err
         assert "extra" in captured.err
+        assert "[hindclaw]" in captured.err
 
     def test_debug_log_silent_when_debug_false(self, capsys):
-        from scripts.lib.config import debug_log
-
         config = {"debug": False}
         debug_log(config, "should not appear")
 
@@ -777,13 +538,20 @@ class TestDebugLog:
         assert captured.err == ""
 
     def test_debug_log_silent_when_debug_missing(self, capsys):
-        from scripts.lib.config import debug_log
-
         config = {}
         debug_log(config, "should not appear")
 
         captured = capsys.readouterr()
         assert captured.err == ""
+
+    def test_debug_log_handles_multiple_args(self, capsys):
+        config = {"debug": True}
+        debug_log(config, "arg1", "arg2", "arg3")
+
+        captured = capsys.readouterr()
+        assert "arg1" in captured.err
+        assert "arg2" in captured.err
+        assert "arg3" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -796,19 +564,21 @@ class TestLoadJson:
         result = _load_json("/nonexistent/path/file.json")
         assert result == {}
 
-    def test_load_json_returns_empty_dict_for_invalid_json(self, tmp_path):
-        from scripts.lib.config import _load_json
-        bad_file = str(tmp_path / "bad.json")
-        with open(bad_file, "w") as f:
-            f.write("not json {{{")
-        result = _load_json(bad_file)
-        assert result == {}
+    def test_load_json_returns_empty_dict_for_invalid_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from scripts.lib.config import _load_json
+            bad_file = os.path.join(tmp, "bad.json")
+            with open(bad_file, "w") as f:
+                f.write("not json {{{")
+            result = _load_json(bad_file)
+            assert result == {}
 
-    def test_load_json_returns_data_for_valid_file(self, tmp_path):
-        from scripts.lib.config import _load_json
-        good_file = str(tmp_path / "good.json")
-        data = {"key": "value", "num": 42}
-        with open(good_file, "w") as f:
-            json.dump(data, f)
-        result = _load_json(good_file)
-        assert result == data
+    def test_load_json_returns_data_for_valid_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from scripts.lib.config import _load_json
+            good_file = os.path.join(tmp, "good.json")
+            data = {"key": "value", "num": 42}
+            with open(good_file, "w") as f:
+                json.dump(data, f)
+            result = _load_json(good_file)
+            assert result == data
